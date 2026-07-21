@@ -20,6 +20,7 @@ const LANE_ACTIVE: u64 = 1;
 struct LaneHeader {
     /// Lane ownership: `LANE_FREE` or `LANE_ACTIVE`.
     state: AtomicU64,
+    metadata: LaneMetadata,
     /// Claimed-up-to sequence: advanced before a ring cell is written.
     producer_reservation: CacheAlignedAtomicSize,
     /// Visible-up-to sequence: advanced after a ring cell is written; consumers
@@ -44,6 +45,44 @@ pub(crate) struct ProducerLane {
     payload_size: usize,
 
     mask: usize, // capacity - 1
+}
+
+#[repr(C)]
+struct LaneMetadata {
+    /// Queue-assigned identifier of the lane's owning producer.
+    /// `0` if the lane has never been owned.
+    identifier: AtomicU64,
+    /// Count of messages refused by backpressure
+    rejected_items: AtomicU64,
+}
+
+impl Default for LaneMetadata {
+    fn default() -> Self {
+        Self {
+            identifier: AtomicU64::new(0),
+            rejected_items: AtomicU64::new(0),
+        }
+    }
+}
+
+impl LaneMetadata {
+    fn reset_for_new_owner(&self, identifier: u64) {
+        self.rejected_items.store(0, Ordering::Relaxed);
+        self.identifier.store(identifier, Ordering::Release);
+    }
+
+    /// Advisory snapshot of [`LaneMetadata`]
+    fn snapshot(&self) -> LaneMetadataSnapshot {
+        LaneMetadataSnapshot {
+            identifier: self.identifier.load(Ordering::Acquire),
+            rejected_items: self.rejected_items.load(Ordering::Relaxed),
+        }
+    }
+}
+
+struct LaneMetadataSnapshot {
+    identifier: u64,
+    rejected_items: u64,
 }
 
 #[inline]
@@ -89,6 +128,7 @@ impl ProducerLane {
     pub(crate) unsafe fn init(block: NonNull<u8>, consumer_slots: usize) {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
+            metadata: LaneMetadata::default(),
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
         };
@@ -164,13 +204,20 @@ impl ProducerLane {
         unsafe { self.ring.byte_add(offset) }
     }
 
-    /// Claims the lane for a producer. Returns `false` if already owned.
+    /// Claims the lane for a producer, installing its queue-assigned
+    /// `identifier`. Returns `false` if already owned.
     #[must_use]
-    pub(crate) fn try_acquire(&self) -> bool {
-        self.header()
+    pub(crate) fn try_acquire(&self, identifier: u64) -> bool {
+        let header = self.header();
+        if header
             .state
             .compare_exchange(LANE_FREE, LANE_ACTIVE, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+            .is_err()
+        {
+            return false;
+        }
+        header.metadata.reset_for_new_owner(identifier);
+        true
     }
 
     /// Releases the lane back to free.
@@ -234,6 +281,10 @@ impl ProducerLane {
         // consumer still needs. Unowned slots sit at the top, so they never
         // gate.
         if start.wrapping_add(count.get()) > self.consumer_state.reserve_limit() {
+            self.header()
+                .metadata
+                .rejected_items
+                .fetch_add(count.get() as u64, Ordering::Relaxed);
             return None;
         }
         // Claim before the writes; consumers only read `< producer_publication`.
@@ -252,6 +303,27 @@ impl ProducerLane {
     }
 
     #[inline]
+    pub(crate) fn identifier(&self) -> u64 {
+        self.header().metadata.identifier.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn is_active(&self) -> bool {
+        self.header().state.load(Ordering::Acquire) == LANE_ACTIVE
+    }
+
+    pub(crate) fn metadata(&self) -> super::LaneMetadata {
+        let metadata_snapshot = self.header().metadata.snapshot();
+        let is_active = self.is_active();
+
+        super::LaneMetadata {
+            identifier: metadata_snapshot.identifier,
+            rejected_items: metadata_snapshot.rejected_items,
+            is_active,
+        }
+    }
+
+    #[inline]
     pub(crate) fn published(&self) -> usize {
         self.header().producer_publication.load(Ordering::Acquire)
     }
@@ -266,6 +338,7 @@ impl ProducerLane {
 mod tests {
     use super::*;
     use crate::shmem::Region;
+    use assert_matches::assert_matches;
     use std::num::NonZeroUsize;
 
     type Payload = u64;
@@ -311,16 +384,119 @@ mod tests {
     #[test]
     fn lane_ownership_is_exclusive() {
         let (_region, lane) = lane(4, 1);
-        assert!(lane.try_acquire());
-        assert!(!lane.try_acquire());
+        assert!(lane.try_acquire(1));
+        assert!(!lane.try_acquire(2));
         lane.release();
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(3));
+    }
+
+    /// Acquires the lane for identifier 42 and fills its ring against a
+    /// gating consumer, then gets one single-item reserve refused so the lane
+    /// records one rejected item.
+    fn owned_lane_with_one_rejected_item(lane: &mut ProducerLane) {
+        assert!(lane.try_acquire(42));
+        assert_eq!(join_consumer(lane, 0, false), 0);
+        for value in 0..4u64 {
+            assert!(publish_value(lane, value));
+        }
+        assert!(!publish_value(lane, 99));
+    }
+
+    #[test]
+    fn never_owned_lane_reports_sentinel_metadata() {
+        // Given a freshly initialized lane.
+        let (_region, lane) = lane(4, 1);
+
+        // Then it reports no owner and the `0` identifier sentinel.
+        assert!(!lane.is_active());
+        assert_eq!(lane.identifier(), 0);
+    }
+
+    #[test]
+    fn acquire_installs_the_owner_metadata() {
+        // Given a free lane.
+        let (_region, lane) = lane(4, 1);
+
+        // When a producer acquires it with identifier 42.
+        assert!(lane.try_acquire(42));
+
+        // Then the lane is active under that identifier with a clean
+        // rejected-items counter.
+        assert!(lane.is_active());
+        assert_eq!(lane.identifier(), 42);
+        assert_eq!(lane.metadata().rejected_items, 0);
+    }
+
+    #[test]
+    fn refused_reserves_count_rejected_items() {
+        // Given an owned lane whose ring is full against a gating consumer.
+        let (_region, mut lane) = lane(4, 1);
+        assert!(lane.try_acquire(42));
+        assert_eq!(join_consumer(&lane, 0, false), 0);
+        for value in 0..4u64 {
+            assert!(publish_value(&mut lane, value));
+        }
+
+        // When a single-item and a two-item reserve are refused.
+        assert!(!publish_value(&mut lane, 99));
+        assert_matches!(lane.try_reserve(NonZeroUsize::new(2).unwrap()), None);
+
+        // Then every refused item is counted.
+        assert_eq!(lane.metadata().rejected_items, 3);
+    }
+
+    #[test]
+    fn recover_preserves_the_dead_owner_metadata() {
+        // Given a dead owner's lane holding one rejected item.
+        let (_region, mut lane) = lane(4, 1);
+        owned_lane_with_one_rejected_item(&mut lane);
+
+        // When the lane is recovered.
+        lane.recover();
+
+        // Then the dead owner's metadata carries over: the recovered producer
+        // continues that stream.
+        assert!(lane.is_active());
+        assert_eq!(lane.identifier(), 42);
+        assert_eq!(lane.metadata().rejected_items, 1);
+    }
+
+    #[test]
+    fn released_lane_keeps_the_last_owner_metadata() {
+        // Given an owned lane holding one rejected item.
+        let (_region, mut lane) = lane(4, 1);
+        owned_lane_with_one_rejected_item(&mut lane);
+
+        // When the owner releases the lane.
+        lane.release();
+
+        // Then the last owner's metadata stays readable (post-mortem
+        // visibility).
+        assert!(!lane.is_active());
+        assert_eq!(lane.identifier(), 42);
+        assert_eq!(lane.metadata().rejected_items, 1);
+    }
+
+    #[test]
+    fn fresh_acquire_resets_the_metadata() {
+        // Given a released lane holding a previous owner's metadata.
+        let (_region, mut lane) = lane(4, 1);
+        owned_lane_with_one_rejected_item(&mut lane);
+        lane.release();
+
+        // When a new owner acquires the lane.
+        assert!(lane.try_acquire(43));
+
+        // Then a fresh identifier and a clean rejected-items counter are
+        // installed.
+        assert_eq!(lane.identifier(), 43);
+        assert_eq!(lane.metadata().rejected_items, 0);
     }
 
     #[test]
     fn publishes_and_advances_cursors() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(1));
         for value in 0..4u64 {
             assert!(publish_value(&mut lane, value * 10));
         }
@@ -334,7 +510,7 @@ mod tests {
     #[test]
     fn reserves_and_publishes_a_batch() {
         let (_region, mut lane) = lane(8, 1);
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(1));
         let count = NonZeroUsize::new(3).unwrap();
         let start = lane.try_reserve(count).expect("reserve");
         for offset in 0..count.get() {
@@ -358,14 +534,17 @@ mod tests {
     #[test]
     fn reserve_rejects_count_above_capacity() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(1));
         assert!(lane.try_reserve(NonZeroUsize::new(5).unwrap()).is_none());
+        // A caller error is not backpressure, so it is not counted as
+        // rejected items.
+        assert_eq!(lane.metadata().rejected_items, 0);
     }
 
     #[test]
     fn no_active_consumers_allows_free_overwrite() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(1));
         // Publish well past one revolution; with no active consumer there is
         // nothing to protect, so every reserve succeeds.
         for value in 0..16u64 {
@@ -381,7 +560,7 @@ mod tests {
     #[test]
     fn backpressure_when_consumer_lags() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(1));
         // Join consumer 0; nothing published yet, so it starts at sequence 0.
         assert_eq!(join_consumer(&lane, 0, false), 0);
 
@@ -407,7 +586,7 @@ mod tests {
     #[test]
     fn released_consumer_no_longer_constrains() {
         let (_region, mut lane) = lane(4, 1);
-        assert!(lane.try_acquire());
+        assert!(lane.try_acquire(1));
         assert_eq!(join_consumer(&lane, 0, false), 0);
         for value in 0..4u64 {
             assert!(publish_value(&mut lane, value));
