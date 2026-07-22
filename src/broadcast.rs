@@ -58,6 +58,7 @@ use crate::{CacheAlignedAtomicSize, VERSION};
 
 use consumer_state::ConsumerState;
 use producer_lane::ProducerLane;
+use valid_lane_index::ValidLaneIndex;
 
 const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 
@@ -380,14 +381,28 @@ impl SharedQueue {
         self.producer_slots
     }
 
+    /// Validates `lane` as an index of this queue's producer lanes.
+    #[inline]
+    fn lane_index(&self, lane: usize) -> Option<ValidLaneIndex> {
+        ValidLaneIndex::new(self, lane)
+    }
+
+    /// Every lane index on this queue, in order.
+    #[inline]
+    fn lane_indices(&self) -> impl Iterator<Item = ValidLaneIndex> {
+        ValidLaneIndex::all(self)
+    }
+
     /// A view over producer lane `lane`.
-    // TODO(#110)
-    fn lane(&self, lane: usize) -> ProducerLane {
-        debug_assert!(lane < self.producer_slots);
-        // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
+    fn lane(&self, lane: ValidLaneIndex) -> ProducerLane {
+        // A `ValidLaneIndex` proves validity only for the queue that issued it;
+        // catch cross-queue mixups in tests.
+        debug_assert!(lane.get() < self.producer_slots);
+        // SAFETY: `ValidLaneIndex` guarantees `lane < producer_slots`; blocks are
+        // `block_stride` apart.
         let block = unsafe {
             self.producer_blocks
-                .byte_add(lane.wrapping_mul(self.block_stride))
+                .byte_add(lane.get().wrapping_mul(self.block_stride))
         };
         // SAFETY: the block was initialized with these parameters.
         unsafe {
@@ -396,14 +411,14 @@ impl SharedQueue {
     }
 
     /// Claims a free producer lane, returning its index.
-    fn acquire_producer_lane(&self) -> Result<usize, Error> {
+    fn acquire_producer_lane(&self) -> Result<ValidLaneIndex, Error> {
         // failed attempt skips an identifier value, which is fine,
         // as only uniqueness is needed.
         let producer_lane_identifier = self
             .header()
             .next_producer_lane_identifier
             .fetch_add(1, Ordering::Relaxed);
-        for lane in 0..self.producer_slots {
+        for lane in self.lane_indices() {
             if self.lane(lane).try_acquire(producer_lane_identifier) {
                 return Ok(lane);
             }
@@ -528,7 +543,7 @@ unsafe impl Sync for SharedQueue {}
 pub struct Producer<T: Copy> {
     queue: SharedQueue,
     lane: ProducerLane,
-    index: usize,
+    index: ValidLaneIndex,
     _marker: PhantomData<T>,
     _invariant: PhantomData<fn(T) -> T>,
 }
@@ -574,7 +589,7 @@ impl<T: Copy> Producer<T> {
     /// The lane this producer owns. Record it so a replacement can
     /// [`recover`](Self::recover) the lane if this producer's process dies.
     pub fn index(&self) -> usize {
-        self.index
+        self.index.get()
     }
 
     /// This producer's queue-assigned identifier: unique per lane acquisition
@@ -600,14 +615,8 @@ impl<T: Copy> Producer<T> {
     ///
     /// Returns [`None`] if `lane_index` is out of range.
     pub fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata> {
-        if lane_index >= self.queue.producer_slots() {
-            return None;
-        }
-
-        let lane = self.queue.lane(lane_index);
-        let lane_metadata = lane.metadata();
-
-        Some(lane_metadata)
+        let lane = self.queue.lane_index(lane_index)?;
+        Some(self.queue.lane(lane).metadata())
     }
 
     /// Takes over a lane whose producer died, without the usual ownership
@@ -629,9 +638,7 @@ impl<T: Copy> Producer<T> {
     }
 
     fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
-        if index >= queue.producer_slots() {
-            return Err(Error::InvalidIndex);
-        }
+        let index = queue.lane_index(index).ok_or(Error::InvalidIndex)?;
         let lane = queue.lane(index);
         lane.recover();
         Ok(Self {
@@ -655,10 +662,8 @@ impl<T: Copy> Producer<T> {
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
         // SAFETY: validated against the stored header.
         let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        if index >= queue.producer_slots() {
-            return Err(Error::InvalidIndex);
-        }
-        queue.lane(index).force_release();
+        let lane = queue.lane_index(index).ok_or(Error::InvalidIndex)?;
+        queue.lane(lane).force_release();
         Ok(())
     }
 
@@ -903,9 +908,8 @@ impl ConsumerCore {
         let index = queue.acquire_consumer_index()?;
         // Cache a view per lane (independent of `queue`), and join each at the
         // frontier, or up to one ring behind it when `from_backlog`.
-        let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
-            .map(|lane| queue.lane(lane))
-            .collect();
+        let lanes: Box<[ProducerLane]> =
+            queue.lane_indices().map(|lane| queue.lane(lane)).collect();
         let next_by_lane = lanes
             .iter()
             .map(|lane| Self::join_lane(lane, index, from_backlog))
@@ -925,9 +929,8 @@ impl ConsumerCore {
         }
         queue.recover_consumer_index(index);
         // Resume each lane at the dead owner's recorded position.
-        let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
-            .map(|lane| queue.lane(lane))
-            .collect();
+        let lanes: Box<[ProducerLane]> =
+            queue.lane_indices().map(|lane| queue.lane(lane)).collect();
         let next_by_lane = lanes
             .iter()
             .map(|lane| Self::recover_lane(lane, index))
@@ -945,7 +948,7 @@ impl ConsumerCore {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
-        for lane in 0..queue.producer_slots() {
+        for lane in queue.lane_indices() {
             queue.lane(lane).consumer_state().release(index);
         }
         queue.release_consumer_index(index);
@@ -1656,6 +1659,36 @@ impl SliceReadBatch<'_> {
 impl Drop for SliceReadBatch<'_> {
     fn drop(&mut self) {
         self.consumer.advance(self.lane, self.count);
+    }
+}
+
+/// Isolates [`ValidLaneIndex`]'s field so a value can only be obtained through the
+/// validating constructors below, which take their bound from the queue itself.
+mod valid_lane_index {
+    use super::SharedQueue;
+
+    /// A validated producer-lane index.
+    ///
+    /// Holding a `ValidLaneIndex` is proof that the wrapped index was checked
+    /// against the issuing queue's `producer_slots`, so lane storage can be
+    /// indexed without re-validating.
+    #[derive(Clone, Copy)]
+    pub(super) struct ValidLaneIndex(usize);
+
+    impl ValidLaneIndex {
+        /// Validates `lane` against `queue`'s producer slots.
+        pub(super) fn new(queue: &SharedQueue, lane: usize) -> Option<Self> {
+            (lane < queue.producer_slots).then_some(Self(lane))
+        }
+
+        /// Every lane index on `queue`, in order.
+        pub(super) fn all(queue: &SharedQueue) -> impl Iterator<Item = Self> {
+            (0..queue.producer_slots).map(Self)
+        }
+
+        pub(super) fn get(self) -> usize {
+            self.0
+        }
     }
 }
 
@@ -2675,6 +2708,12 @@ mod tests {
         unsafe { SharedQueue::create_in_region::<Payload>(&region, config) }.unwrap()
     }
 
+    /// A view over `queue`'s first lane (the recovery tests use single-lane
+    /// queues).
+    fn first_lane(queue: &SharedQueue) -> ProducerLane {
+        queue.lane(queue.lane_index(0).expect("lane 0 exists"))
+    }
+
     #[test]
     fn recover_producer_takes_over_a_wedged_lane() {
         let config = BroadcastConfig {
@@ -2693,7 +2732,7 @@ mod tests {
             assert!(producer.try_write(1).is_ok());
             assert!(producer.try_write(2).is_ok());
         }
-        assert!(queue.lane(0).try_acquire(99));
+        assert!(first_lane(&queue).try_acquire(99));
 
         // The only lane is held, so a normal join is refused.
         assert!(matches!(
@@ -2724,7 +2763,7 @@ mod tests {
 
         // Mimic a producer that reserved a batch but crashed before publishing:
         // the reservation runs ahead of the publication.
-        let mut lane = queue.lane(0);
+        let mut lane = first_lane(&queue);
         assert!(lane.try_acquire(99));
         lane.try_reserve(NonZeroUsize::new(3).unwrap());
         assert_eq!(lane.reserved(), 3);
@@ -2750,7 +2789,7 @@ mod tests {
         // auto-counted rejected items), and then crashed without releasing the
         // lane.
         let index = queue.acquire_consumer_index().unwrap();
-        let mut lane = queue.lane(0);
+        let mut lane = first_lane(&queue);
         assert!(lane.try_acquire(42));
         ConsumerCore::join_lane(&lane, index, false);
         let one = NonZeroUsize::MIN;
@@ -2793,7 +2832,7 @@ mod tests {
         // position recorded (next-to-read = 1). Build that state directly (claim
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        let lane = first_lane(&queue);
         ConsumerCore::join_lane(&lane, index, false);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
@@ -2823,7 +2862,7 @@ mod tests {
         // The only consumer index is claimed and the lane's limit recorded, then
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        let lane = first_lane(&queue);
         ConsumerCore::join_lane(&lane, index, false);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
@@ -2839,7 +2878,7 @@ mod tests {
 
         // Force-release frees it (clear limits + free the index); a catch-up join
         // then reclaims it and reads the still-present backlog from the start.
-        for lane in 0..queue.producer_slots() {
+        for lane in queue.lane_indices() {
             queue.lane(lane).consumer_state().release(index);
         }
         queue.release_consumer_index(index);
