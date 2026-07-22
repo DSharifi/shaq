@@ -381,10 +381,13 @@ impl SharedQueue {
     }
 
     /// A view over producer lane `lane`.
-    // TODO(#110)
-    fn lane(&self, lane: usize) -> ProducerLane {
+    ///
+    /// # Safety
+    /// - `lane` must be a valid lane index, i.e. `lane < producer_slots`.
+    unsafe fn lane(&self, lane: usize) -> ProducerLane {
         debug_assert!(lane < self.producer_slots);
-        // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
+        // SAFETY: caller guarantees `lane < producer_slots`; blocks are
+        // `block_stride` apart.
         let block = unsafe {
             self.producer_blocks
                 .byte_add(lane.wrapping_mul(self.block_stride))
@@ -404,7 +407,8 @@ impl SharedQueue {
             .next_producer_lane_identifier
             .fetch_add(1, Ordering::Relaxed);
         for lane in 0..self.producer_slots {
-            if self.lane(lane).try_acquire(producer_lane_identifier) {
+            // SAFETY: `lane` iterates `0..producer_slots`.
+            if unsafe { self.lane(lane) }.try_acquire(producer_lane_identifier) {
                 return Ok(lane);
             }
         }
@@ -561,7 +565,9 @@ impl<T: Copy> Producer<T> {
 
     fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
         let index = queue.acquire_producer_lane()?;
-        let lane = queue.lane(index);
+        // SAFETY: `acquire_producer_lane` only returns indexes below
+        // `producer_slots`.
+        let lane = unsafe { queue.lane(index) };
         Ok(Self {
             queue,
             lane,
@@ -604,7 +610,8 @@ impl<T: Copy> Producer<T> {
             return None;
         }
 
-        let lane = self.queue.lane(lane_index);
+        // SAFETY: `lane_index < producer_slots` was checked above.
+        let lane = unsafe { self.queue.lane(lane_index) };
         let lane_metadata = lane.metadata();
 
         Some(lane_metadata)
@@ -632,7 +639,8 @@ impl<T: Copy> Producer<T> {
         if index >= queue.producer_slots() {
             return Err(Error::InvalidIndex);
         }
-        let lane = queue.lane(index);
+        // SAFETY: `index < producer_slots` was checked above.
+        let lane = unsafe { queue.lane(index) };
         lane.recover();
         Ok(Self {
             queue,
@@ -658,7 +666,8 @@ impl<T: Copy> Producer<T> {
         if index >= queue.producer_slots() {
             return Err(Error::InvalidIndex);
         }
-        queue.lane(index).force_release();
+        // SAFETY: `index < producer_slots` was checked above.
+        unsafe { queue.lane(index) }.force_release();
         Ok(())
     }
 
@@ -904,7 +913,8 @@ impl ConsumerCore {
         // Cache a view per lane (independent of `queue`), and join each at the
         // frontier, or up to one ring behind it when `from_backlog`.
         let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
-            .map(|lane| queue.lane(lane))
+            // SAFETY: `lane` iterates `0..producer_slots`.
+            .map(|lane| unsafe { queue.lane(lane) })
             .collect();
         let next_by_lane = lanes
             .iter()
@@ -926,7 +936,8 @@ impl ConsumerCore {
         queue.recover_consumer_index(index);
         // Resume each lane at the dead owner's recorded position.
         let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
-            .map(|lane| queue.lane(lane))
+            // SAFETY: `lane` iterates `0..producer_slots`.
+            .map(|lane| unsafe { queue.lane(lane) })
             .collect();
         let next_by_lane = lanes
             .iter()
@@ -946,7 +957,8 @@ impl ConsumerCore {
             return Err(Error::InvalidIndex);
         }
         for lane in 0..queue.producer_slots() {
-            queue.lane(lane).consumer_state().release(index);
+            // SAFETY: `lane` iterates `0..producer_slots`.
+            unsafe { queue.lane(lane) }.consumer_state().release(index);
         }
         queue.release_consumer_index(index);
         Ok(())
@@ -2693,7 +2705,9 @@ mod tests {
             assert!(producer.try_write(1).is_ok());
             assert!(producer.try_write(2).is_ok());
         }
-        assert!(queue.lane(0).try_acquire(99));
+        // SAFETY: the queue is configured with one producer slot, so lane 0
+        // is valid.
+        assert!(unsafe { queue.lane(0) }.try_acquire(99));
 
         // The only lane is held, so a normal join is refused.
         assert!(matches!(
@@ -2724,7 +2738,9 @@ mod tests {
 
         // Mimic a producer that reserved a batch but crashed before publishing:
         // the reservation runs ahead of the publication.
-        let mut lane = queue.lane(0);
+        // SAFETY: the queue is configured with one producer slot, so lane 0
+        // is valid.
+        let mut lane = unsafe { queue.lane(0) };
         assert!(lane.try_acquire(99));
         lane.try_reserve(NonZeroUsize::new(3).unwrap());
         assert_eq!(lane.reserved(), 3);
@@ -2750,7 +2766,9 @@ mod tests {
         // auto-counted rejected items), and then crashed without releasing the
         // lane.
         let index = queue.acquire_consumer_index().unwrap();
-        let mut lane = queue.lane(0);
+        // SAFETY: the queue is configured with one producer slot, so lane 0
+        // is valid.
+        let mut lane = unsafe { queue.lane(0) };
         assert!(lane.try_acquire(42));
         ConsumerCore::join_lane(&lane, index, false);
         let one = NonZeroUsize::MIN;
@@ -2793,7 +2811,9 @@ mod tests {
         // position recorded (next-to-read = 1). Build that state directly (claim
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        // SAFETY: the queue is configured with one producer slot, so lane 0
+        // is valid.
+        let lane = unsafe { queue.lane(0) };
         ConsumerCore::join_lane(&lane, index, false);
 
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
@@ -2823,7 +2843,9 @@ mod tests {
         // The only consumer index is claimed and the lane's limit recorded, then
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        // SAFETY: the queue is configured with one producer slot, so lane 0
+        // is valid.
+        let lane = unsafe { queue.lane(0) };
         ConsumerCore::join_lane(&lane, index, false);
         let mut producer = Producer::from_queue(queue.clone()).unwrap();
         for value in 0..3u64 {
@@ -2840,7 +2862,8 @@ mod tests {
         // Force-release frees it (clear limits + free the index); a catch-up join
         // then reclaims it and reads the still-present backlog from the start.
         for lane in 0..queue.producer_slots() {
-            queue.lane(lane).consumer_state().release(index);
+            // SAFETY: `lane` iterates `0..producer_slots`.
+            unsafe { queue.lane(lane) }.consumer_state().release(index);
         }
         queue.release_consumer_index(index);
         let mut fresh = Consumer::from_queue(queue.clone(), true).unwrap();
