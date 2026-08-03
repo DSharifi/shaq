@@ -5,13 +5,23 @@
 //! lossless — a producer cannot overwrite a cell until every consumer has read
 //! it.
 //!
+//! [`Broadcast`] is the entry point: [`Broadcast::create`]/[`Broadcast::join`]
+//! set up or attach to the queue itself, without claiming a producer or
+//! consumer lane. Call [`Broadcast::producer`]/[`Broadcast::consumer`] as many
+//! times as needed (once per lane/index wanted) to mint the handles below; a
+//! single [`Broadcast`] can outlive and mint lanes for many threads.
+//! [`Producer::create`]/[`Producer::join`], [`Consumer::create`]/
+//! [`Consumer::join`], and [`SliceConsumer::join`] are convenience entry points
+//! for processes that only need one endpoint.
+//!
 //! [`Producer`] writes via by-value [`Producer::try_write`], an in-place
 //! [`WriteGuard`], or a [`WriteBatch`]; [`Consumer`] reads via
 //! [`Consumer::try_read`], a [`ReadGuard`], or a [`ReadBatch`], with blocking
 //! `*_timeout` variants that park on the queue's futex when idle. A consumer
 //! joins at each lane's reservation frontier, skipping values that were already
-//! reserved. After a crash, a consumer index can be taken over with `recover`
-//! or returned to the pool with `force_release`. A fully joined consumer
+//! reserved. After a crash, a consumer index can be taken over with
+//! [`Broadcast::recover_consumer`] or returned to the pool with
+//! [`Broadcast::force_release`]. A fully joined consumer
 //! resumes where the dead owner was; an interrupted join restarts at each
 //! lane's current reservation frontier.
 //!
@@ -68,6 +78,221 @@ pub struct BroadcastConfig {
     pub capacity: usize,
     pub producer_slots: usize,
     pub consumer_slots: usize,
+}
+
+pub struct Broadcast<MessageType> {
+    shared_queue: SharedQueue,
+    _message_type: PhantomData<MessageType>,
+    // Prevent payload-lifetime coercions.
+    _payload_invariant: PhantomData<fn(MessageType) -> MessageType>,
+}
+
+impl<MessageType> Clone for Broadcast<MessageType> {
+    fn clone(&self) -> Self {
+        Self {
+            shared_queue: self.shared_queue.clone(),
+            _message_type: PhantomData,
+            _payload_invariant: PhantomData,
+        }
+    }
+}
+
+/// Marker payload type for [`Broadcast::join_untyped`].
+pub struct UnknownType;
+
+impl<T> Broadcast<T>
+where
+    T: Copy,
+{
+    /// Creates a broadcast queue in `file`.
+    ///
+    /// # Safety
+    /// - `file` must be initialized as a broadcast queue exactly once (by the
+    ///   designated initializer), and not resized while any handle is joined.
+    /// - Every participant must use the same `T` and layout, and each queued
+    ///   value must be valid in every process that reads it. The `Copy` bound
+    ///   does not make embedded pointers or references process-portable.
+    pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
+        // SAFETY: caller guarantees this mapping is initialized exactly once.
+        let shared_queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
+
+        Ok(Self {
+            shared_queue,
+            _message_type: PhantomData,
+            _payload_invariant: PhantomData,
+        })
+    }
+
+    /// Joins an existing broadcast queue in `file`.
+    ///
+    /// # Safety
+    /// - `file` must refer to a live broadcast queue and not be resized while
+    ///   joined.
+    /// - Every participant must use the same `T` and layout, and each queued
+    ///   value must be valid in every process that reads it. The `Copy` bound
+    ///   does not make embedded pointers or references process-portable.
+    pub unsafe fn join(file: &File) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let shared_queue = unsafe { SharedQueue::join::<T>(file) }?;
+        Ok(Self {
+            shared_queue,
+            _message_type: PhantomData,
+            _payload_invariant: PhantomData,
+        })
+    }
+
+    /// Creates a new [`Producer`] if there is a free producer slot.
+    pub fn producer(&self) -> Result<Producer<T>, Error> {
+        Producer::from_queue(self.shared_queue.clone())
+    }
+
+    /// Creates a new [`Consumer`] if there is a free consumer slot.
+    pub fn consumer(&self) -> Result<Consumer<T>, Error> {
+        Consumer::from_queue(self.shared_queue.clone())
+    }
+
+    /// Takes over a consumer index whose owner died. A fully joined consumer
+    /// **resumes where the dead owner left off** on each lane — its unread items
+    /// are still pinned by its reserve limit, so they are delivered. If the
+    /// owner died before joining every lane, recovery instead restarts every
+    /// lane at its current reservation frontier. To unconditionally restart
+    /// fresh, [`force_release`](Self::force_release) the index and `join` it.
+    ///
+    /// # Safety
+    /// - The consumer that previously owned `consumer_index` must be dead and
+    ///   no other live handle may use it. Two consumers sharing an index
+    ///   corrupts each other's cursor.
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
+    pub unsafe fn recover_consumer(&self, consumer_index: usize) -> Result<Consumer<T>, Error> {
+        Consumer::recover_in_queue(self.shared_queue.clone(), consumer_index)
+    }
+}
+
+impl Broadcast<UnknownType> {
+    /// Joins an existing broadcast queue in `file` as an untyped consumer,
+    /// starting at each lane's reservation frontier. Values already reserved
+    /// are skipped, even if they have not yet been published.
+    ///
+    /// Pinned to [`UnknownType`] rather than generic over the caller's choice
+    /// of `T`: the queue's payload layout is never checked here (that's the
+    /// point of "untyped"), so a caller-chosen `Copy` `T` would let
+    /// [`Broadcast::producer`]/[`Broadcast::consumer`] hand out typed handles
+    /// whose `T` was never validated against the real payload — a silent
+    /// out-of-bounds write/read the moment sizes differ.
+    ///
+    /// # Safety
+    /// - `file` must refer to a live broadcast queue and not be resized while
+    ///   joined.
+    /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
+    ///   requirement.
+    /// - Payload bytes must be meaningful to the caller without relying on Rust
+    ///   type validation.
+    ///
+    /// Only untyped consumers are reachable from [`Broadcast<UnknownType>`]
+    ///
+    /// ```
+    /// use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
+    /// use std::fs::OpenOptions;
+    ///
+    /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-untyped", std::process::id()));
+    /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+    /// # let config = BroadcastConfig { capacity: 4, producer_slots: 1, consumer_slots: 1 };
+    /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
+    /// #
+    /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
+    /// // SAFETY: `u64`'s entire representation is initialized.
+    /// assert!(unsafe { broadcast.slice_consumer() }.is_ok());
+    /// # std::fs::remove_file(&path).ok();
+    /// ```
+    ///
+    /// #### [`producer`](Broadcast::producer)/[`consumer`](Broadcast::consumer) can not be created
+    /// from a broadcast that is joined untyped.
+    ///
+    /// ```compile_fail
+    /// # use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
+    /// # use std::fs::OpenOptions;
+    /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-producer", std::process::id()));
+    /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+    /// # let config = BroadcastConfig { capacity: 4, producer_slots: 1, consumer_slots: 1 };
+    /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
+    /// #
+    /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
+    /// let _ = broadcast.producer(); // Untyped broadcast can not create typed producer
+    /// ```
+    ///
+    /// ```compile_fail
+    /// # use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
+    /// # use std::fs::OpenOptions;
+    /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-consumer", std::process::id()));
+    /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
+    /// # let config = BroadcastConfig { capacity: 4, producer_slots: 1, consumer_slots: 1 };
+    /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
+    /// #
+    /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
+    /// let _ = broadcast.consumer(); // Untyped broadcast can not create typed consumer
+    /// ```
+    pub unsafe fn join_untyped(file: &File) -> Result<Self, Error> {
+        // SAFETY: validated against the stored header.
+        let shared_queue = unsafe { SharedQueue::join_untyped(file) }?;
+        Ok(Self {
+            shared_queue,
+            _message_type: PhantomData,
+            _payload_invariant: PhantomData,
+        })
+    }
+}
+
+impl<T> Broadcast<T> {
+    fn from_queue(shared_queue: SharedQueue) -> Self {
+        Self {
+            shared_queue,
+            _message_type: PhantomData,
+            _payload_invariant: PhantomData,
+        }
+    }
+
+    /// Creates a new [`SliceConsumer`] if there is a free consumer slot. The
+    /// consumer discovers the payload size from the queue header and reads
+    /// each payload as bytes.
+    ///
+    /// # Safety
+    /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
+    ///   requirement.
+    pub unsafe fn slice_consumer(&self) -> Result<SliceConsumer, Error> {
+        SliceConsumer::from_queue(self.shared_queue.clone())
+    }
+
+    /// Takes over a consumer index whose owner died. A fully joined consumer
+    /// resumes where the dead owner left off on each lane. If the owner died
+    /// before joining every lane, recovery instead restarts every lane at its
+    /// current reservation frontier.
+    ///
+    /// # Safety
+    /// - the consumer that owned `index` must be dead and no other live handle
+    ///   may use it.
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
+    pub unsafe fn recover_slice_consumer(
+        &self,
+        consumer_index: usize,
+    ) -> Result<SliceConsumer, Error> {
+        SliceConsumer::recover_in_queue(self.shared_queue.clone(), consumer_index)
+    }
+
+    /// Force-releases a consumer index whose owner died, returning it to the
+    /// free pool.
+    ///
+    /// # Safety
+    /// - `index` must be dead
+    ///   and no other live handle may use it.
+    /// - Force-release must be serialized externally, with the same restrictions
+    ///   as [`Self::recover_consumer`]/[`Self::recover_slice_consumer`].
+    pub unsafe fn force_release(&self, index: usize) -> Result<(), Error> {
+        ConsumerCore::force_release(&self.shared_queue, index)
+    }
 }
 
 /// Shared header at the start of the region. The producer-lane cursors and the
@@ -503,7 +728,8 @@ unsafe impl Sync for SharedQueue {}
 /// write ops take `&mut self`); move it between threads to hand off ownership.
 ///
 /// Holds the lane view directly (stable for the producer's lifetime); the
-/// `queue` is kept for `try_clone` and to keep the region mapping alive.
+/// `queue` is kept to wake blocked consumers and to keep the region mapping
+/// alive.
 pub struct Producer<T: Copy> {
     queue: SharedQueue,
     lane: ProducerLane,
@@ -522,9 +748,9 @@ impl<T: Copy> Producer<T> {
     ///   value must be valid in every process that reads it. The `Copy` bound
     ///   does not make embedded pointers or references process-portable.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
-        Self::from_queue(queue)
+        // SAFETY: the caller upholds the Broadcast::create requirements.
+        let broadcast = unsafe { Broadcast::<T>::create(file, config) }?;
+        broadcast.producer()
     }
 
     /// Joins an existing broadcast queue in `file` as a producer.
@@ -533,9 +759,14 @@ impl<T: Copy> Producer<T> {
     /// - `file` must refer to a live broadcast queue (not resized while joined),
     ///   with the same `T` as every other handle (see [`Self::create`]).
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::from_queue(queue)
+        // SAFETY: the caller upholds the Broadcast::join requirements.
+        let broadcast = unsafe { Broadcast::<T>::join(file) }?;
+        broadcast.producer()
+    }
+
+    /// Returns a lane-free handle that shares this producer's queue mapping.
+    pub fn broadcast_handle(&self) -> Broadcast<T> {
+        Broadcast::from_queue(self.queue.clone())
     }
 
     fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
@@ -555,28 +786,6 @@ impl<T: Copy> Producer<T> {
     /// consumers.
     pub fn index(&self) -> usize {
         self.index
-    }
-
-    /// Claims another free lane on the same queue.
-    pub fn try_clone(&self) -> Result<Self, Error> {
-        Self::from_queue(self.queue.clone())
-    }
-
-    /// Joins the same queue as a consumer (sharing the mapping). The consumer
-    /// starts at each lane's reservation frontier, skipping values that were
-    /// already reserved.
-    pub fn join_as_consumer(&self) -> Result<Consumer<T>, Error> {
-        Consumer::from_queue(self.queue.clone())
-    }
-
-    /// Joins the same queue as an untyped consumer. The consumer discovers the
-    /// payload size from the queue header and reads each payload as bytes.
-    ///
-    /// # Safety
-    /// - The payload must satisfy [`SliceConsumer`]'s full-byte initialization
-    ///   requirement.
-    pub unsafe fn join_as_slice_consumer(&self) -> Result<SliceConsumer, Error> {
-        SliceConsumer::from_queue(self.queue.clone())
     }
 
     /// Publishes one value, or returns it on backpressure (the slowest consumer
@@ -830,7 +1039,7 @@ impl ConsumerCore {
         })
     }
 
-    fn force_release(queue: SharedQueue, index: usize) -> Result<(), Error> {
+    fn force_release(queue: &SharedQueue, index: usize) -> Result<(), Error> {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
@@ -971,9 +1180,9 @@ impl<T: Copy> Consumer<T> {
     ///   handles must use the same `T` and layout with values valid in every
     ///   process that reads them.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
-        Self::from_queue(queue)
+        // SAFETY: the caller upholds the Broadcast::create requirements.
+        let broadcast = unsafe { Broadcast::<T>::create(file, config) }?;
+        broadcast.consumer()
     }
 
     /// Joins an existing broadcast queue in `file` as a consumer, starting at
@@ -983,9 +1192,9 @@ impl<T: Copy> Consumer<T> {
     /// # Safety
     /// - Same as [`Producer::join`]: live queue, same `T` across all handles.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::from_queue(queue)
+        // SAFETY: the caller upholds the Broadcast::join requirements.
+        let broadcast = unsafe { Broadcast::<T>::join(file) }?;
+        broadcast.consumer()
     }
 
     fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
@@ -1000,6 +1209,11 @@ impl<T: Copy> Consumer<T> {
     /// [`recover`](Self::recover) it if this consumer's process dies.
     pub fn index(&self) -> usize {
         self.core.index()
+    }
+
+    /// Returns a lane-free handle that shares this consumer's queue mapping.
+    pub fn broadcast_handle(&self) -> Broadcast<T> {
+        Broadcast::from_queue(self.core.queue.clone())
     }
 
     /// Takes over a consumer index whose owner died. A fully joined consumer
@@ -1017,11 +1231,17 @@ impl<T: Copy> Consumer<T> {
     ///   recovery/force-release operations or with producer/consumer joins or
     ///   drops on the same queue.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        Self::recover_in_queue(queue, index)
+        // SAFETY: the caller upholds the shared queue join requirements.
+        let broadcast = unsafe { Broadcast::<T>::join(file) }?;
+        // SAFETY: the caller guarantees the previous owner is dead and
+        // serializes recovery.
+        unsafe { broadcast.recover_consumer(index) }
     }
 
+    /// # Safety
+    /// - Recovery must be serialized externally; it must not race with other
+    ///   recovery/force-release operations or with producer/consumer joins or
+    ///   drops on the same queue.
     fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
         Ok(Self {
             core: ConsumerCore::recover_in_queue(queue, index)?,
@@ -1041,9 +1261,11 @@ impl<T: Copy> Consumer<T> {
     /// - Force-release must be serialized externally, with the same restrictions
     ///   as [`Self::recover`].
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join::<T>(file) }?;
-        ConsumerCore::force_release(queue, index)
+        // SAFETY: the caller upholds the Broadcast::join requirements.
+        let broadcast = unsafe { Broadcast::<T>::join(file) }?;
+        // SAFETY: the caller guarantees the previous owner is dead and
+        // serializes force-release.
+        unsafe { broadcast.force_release(index) }
     }
 
     /// Reads the next available value by copying it out, or `None` if every lane
@@ -1249,9 +1471,16 @@ impl SliceConsumer {
     /// - Payload bytes must be meaningful to the caller without relying on Rust
     ///   type validation.
     pub unsafe fn join(file: &File) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join_untyped(file) }?;
-        Self::from_queue(queue)
+        // SAFETY: the caller upholds the Broadcast::join_untyped requirements.
+        let broadcast = unsafe { Broadcast::join_untyped(file) }?;
+        // SAFETY: the caller upholds the full-byte initialization requirement.
+        unsafe { broadcast.slice_consumer() }
+    }
+
+    /// Returns an untyped, lane-free handle that shares this consumer's queue
+    /// mapping.
+    pub fn broadcast_handle(&self) -> Broadcast<UnknownType> {
+        Broadcast::from_queue(self.core.queue.clone())
     }
 
     fn from_queue(queue: SharedQueue) -> Result<Self, Error> {
@@ -1283,9 +1512,11 @@ impl SliceConsumer {
     ///   recovery/force-release operations or with producer/consumer joins or
     ///   drops on the same queue.
     pub unsafe fn recover(file: &File, index: usize) -> Result<Self, Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join_untyped(file) }?;
-        Self::recover_in_queue(queue, index)
+        // SAFETY: the caller upholds the untyped shared queue join requirements.
+        let broadcast = unsafe { Broadcast::join_untyped(file) }?;
+        // SAFETY: the caller guarantees the previous owner is dead and
+        // serializes recovery.
+        unsafe { broadcast.recover_slice_consumer(index) }
     }
 
     fn recover_in_queue(queue: SharedQueue, index: usize) -> Result<Self, Error> {
@@ -1303,9 +1534,11 @@ impl SliceConsumer {
     /// - Force-release must be serialized externally, with the same restrictions
     ///   as [`Self::recover`].
     pub unsafe fn force_release(file: &File, index: usize) -> Result<(), Error> {
-        // SAFETY: validated against the stored header.
-        let queue = unsafe { SharedQueue::join_untyped(file) }?;
-        ConsumerCore::force_release(queue, index)
+        // SAFETY: the caller upholds the untyped shared queue join requirements.
+        let broadcast = unsafe { Broadcast::join_untyped(file) }?;
+        // SAFETY: the caller guarantees the previous owner is dead and
+        // serializes force-release.
+        unsafe { broadcast.force_release(index) }
     }
 
     /// Reserves the next available payload and exposes it as bytes, or `None` if
@@ -1512,12 +1745,20 @@ mod tests {
                 producer_slots: 2,
                 consumer_slots: 1,
             });
-            // Two lanes total: the original plus one clone exhausts them.
-            let p1 = p0.try_clone().unwrap();
-            assert!(matches!(p0.try_clone(), Err(Error::ProducerSlotsExhausted)));
+            let broadcast = p0.broadcast_handle();
+            // Two lanes total: the original plus one binding from a cloned
+            // broadcast exhausts them.
+            let p1 = broadcast.producer().unwrap();
+            assert!(matches!(
+                broadcast.producer(),
+                Err(Error::ProducerSlotsExhausted)
+            ));
             drop(p1);
             // The dropped lane is retired, not returned to the pool.
-            assert!(matches!(p0.try_clone(), Err(Error::ProducerSlotsExhausted)));
+            assert!(matches!(
+                broadcast.producer(),
+                Err(Error::ProducerSlotsExhausted)
+            ));
         }
     }
 
@@ -1529,7 +1770,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             for value in 0..5u64 {
                 assert!(p.try_write(value * 10).is_ok());
             }
@@ -1547,7 +1788,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             {
                 // SAFETY: every reserved slot is initialized below.
                 let mut batch =
@@ -1572,7 +1813,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             assert!(p.try_write_slice(&[]));
             assert!(p.try_write_slice(&[1, 2, 3]));
 
@@ -1612,7 +1853,7 @@ mod tests {
             }
             // And no consumer can join when there are no consumer slots.
             assert!(matches!(
-                p.join_as_consumer(),
+                p.broadcast_handle().consumer(),
                 Err(Error::ConsumerSlotsExhausted)
             ));
         }
@@ -1684,7 +1925,7 @@ mod tests {
             consumer_slots: 1,
         });
         // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
-        let mut consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
+        let mut consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
         assert_eq!(consumer.payload_size(), size_of::<Payload>());
 
         let value = 0x0102_0304_0506_0708u64;
@@ -1706,7 +1947,7 @@ mod tests {
             consumer_slots: 1,
         });
         // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
-        let mut consumer = unsafe { producer.join_as_slice_consumer() }.unwrap();
+        let mut consumer = unsafe { producer.broadcast_handle().slice_consumer() }.unwrap();
 
         assert!(producer.try_write_slice(&[11, 12, 13]));
         {
@@ -1776,11 +2017,11 @@ mod tests {
                 consumer_slots: 2,
             });
             // Both consumers join before anything is published, so they start at 0.
-            let mut c0 = p.join_as_consumer().unwrap();
-            let mut c1 = p.join_as_consumer().unwrap();
+            let mut c0 = p.broadcast_handle().consumer().unwrap();
+            let mut c1 = p.broadcast_handle().consumer().unwrap();
             // A third consumer would exhaust the slots.
             assert!(matches!(
-                p.join_as_consumer(),
+                p.broadcast_handle().consumer(),
                 Err(Error::ConsumerSlotsExhausted)
             ));
 
@@ -1796,7 +2037,7 @@ mod tests {
 
             // A released consumer's index can be reclaimed.
             drop(c1);
-            assert!(p.join_as_consumer().is_ok());
+            assert!(p.broadcast_handle().consumer().is_ok());
         }
     }
 
@@ -1816,8 +2057,8 @@ mod tests {
                 consumer_slots: 2,
             });
             let consumers = [
-                producer.join_as_consumer().unwrap(),
-                producer.join_as_consumer().unwrap(),
+                producer.broadcast_handle().consumer().unwrap(),
+                producer.broadcast_handle().consumer().unwrap(),
             ];
             let start = Arc::new(Barrier::new(consumers.len() + 1));
 
@@ -1878,7 +2119,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
 
             // Fill the ring; the consumer has read nothing, so the producer blocks.
             for value in 0..4u64 {
@@ -1901,7 +2142,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             assert!(p.try_write(10).is_ok());
 
             let guard = c.try_reserve_read().expect("readable");
@@ -1929,7 +2170,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
 
             // A single write guard publishes its cell when dropped.
             {
@@ -1955,7 +2196,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             for value in 0..5u64 {
                 assert!(p.try_write(value).is_ok());
             }
@@ -1996,7 +2237,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             for value in 0..4u64 {
                 assert!(p.try_write(value).is_ok());
             }
@@ -2028,7 +2269,7 @@ mod tests {
                 assert!(p.try_write(value).is_ok());
             }
             // Joins at the current reservation (3), so it sees only later items.
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             assert!(p.try_write(99).is_ok());
             assert_eq!(c.try_read(), Some(99));
             assert_eq!(c.try_read(), None);
@@ -2068,7 +2309,7 @@ mod tests {
                 producer_slots: 2,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
 
             // Nothing published on any lane yet: a zero timeout reports `Timeout`
             // rather than blocking.
@@ -2096,7 +2337,7 @@ mod tests {
                 producer_slots: 2,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
             assert!(matches!(
                 c.reserve_read_timeout(Duration::from_millis(5)),
                 Err(WaitError::Timeout)
@@ -2112,7 +2353,7 @@ mod tests {
                 producer_slots: 1,
                 consumer_slots: 1,
             });
-            let mut c = p.join_as_consumer().unwrap();
+            let mut c = p.broadcast_handle().consumer().unwrap();
 
             assert!(matches!(
                 c.read_timeout(Duration::ZERO),
@@ -2295,5 +2536,67 @@ mod tests {
             Consumer::<Payload>::recover_in_queue(queue.clone(), 1),
             Err(Error::InvalidIndex)
         ));
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn broadcast_create_clone_and_join_share_all_lanes() {
+        let config = BroadcastConfig {
+            capacity: 8,
+            producer_slots: 2,
+            consumer_slots: 1,
+        };
+        let file = create_temp_shmem_file().expect("temp file");
+        // SAFETY: a fresh temp file, initialized exactly once here.
+        let creator = unsafe { Broadcast::<Payload>::create(&file, config) }.unwrap();
+
+        let mut p0 = creator.producer().unwrap();
+        // SAFETY: the file now holds a live queue with the same `T` and layout.
+        let joiner = unsafe { Broadcast::<Payload>::join(&file) }.unwrap();
+        let mut p1 = joiner.producer().unwrap();
+        assert!(matches!(
+            creator.producer(),
+            Err(Error::ProducerSlotsExhausted)
+        ));
+
+        let mut consumer = creator.consumer().unwrap();
+        assert!(p0.try_write(1).is_ok());
+        assert!(p1.try_write(2).is_ok());
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
+    }
+
+    #[test]
+    fn every_endpoint_exposes_its_broadcast() {
+        let mut p0 = create_heap_producer(BroadcastConfig {
+            capacity: 8,
+            producer_slots: 2,
+            consumer_slots: 2,
+        });
+        let mut consumer = p0.broadcast_handle().consumer().unwrap();
+        let mut p1 = consumer.broadcast_handle().producer().unwrap();
+        // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+        let mut slice_consumer = unsafe { p1.broadcast_handle().slice_consumer() }.unwrap();
+
+        let untyped: Broadcast<UnknownType> = slice_consumer.broadcast_handle();
+        // Both consumer slots are already claimed.
+        assert!(matches!(
+            // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+            unsafe { untyped.slice_consumer() },
+            Err(Error::ConsumerSlotsExhausted)
+        ));
+
+        assert!(p0.try_write(1).is_ok());
+        assert!(p1.try_write(2).is_ok());
+        assert_eq!(consumer.try_read(), Some(1));
+        assert_eq!(consumer.try_read(), Some(2));
+        assert_eq!(
+            slice_consumer.try_read().unwrap().as_slice(),
+            1u64.to_ne_bytes()
+        );
+        assert_eq!(
+            slice_consumer.try_read().unwrap().as_slice(),
+            2u64.to_ne_bytes()
+        );
     }
 }

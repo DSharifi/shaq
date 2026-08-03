@@ -6,7 +6,9 @@ use common::{
     run_total_throughput_loop, setup_exit_handler, Item, SYNC_CADENCE,
 };
 use shaq::{
-    broadcast::{BroadcastConfig, Consumer as BroadcastConsumer, Producer as BroadcastProducer},
+    broadcast::{
+        Broadcast, BroadcastConfig, Consumer as BroadcastConsumer, Producer as BroadcastProducer,
+    },
     error::WaitError,
     mpmc::{Consumer as MpmcConsumer, Producer as MpmcProducer},
     spsc::{Consumer as SpscConsumer, Producer as SpscProducer},
@@ -394,10 +396,9 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
     let producer_reserve_failures = Arc::new(AtomicU64::new(0));
     let consumer_reserve_failures = Arc::new(AtomicU64::new(0));
 
-    // SAFETY: This thread uniquely creates the queue. The handle is dropped
-    // immediately, freeing its lane for the producer threads to claim.
-    unsafe {
-        let _ = BroadcastProducer::<Item>::create(
+    // SAFETY: This thread uniquely creates the queue.
+    let broadcast = unsafe {
+        Broadcast::<Item>::create(
             &queue_file,
             BroadcastConfig {
                 capacity: BROADCAST_CAPACITY,
@@ -405,14 +406,14 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
                 consumer_slots: consumers,
             },
         )
-        .unwrap();
     }
+    .unwrap();
 
     let mut handles = Vec::new();
 
     for (idx, core_id) in consumer_cores.into_iter().enumerate() {
         let exit = exit.clone();
-        let consumer_file = queue_file.try_clone().unwrap();
+        let broadcast = broadcast.clone();
         let consumer_reserve_failures = consumer_reserve_failures.clone();
         handles.push(
             std::thread::Builder::new()
@@ -423,10 +424,9 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
                         core_affinity::set_for_current(core_id);
                     }
 
-                    // SAFETY: the queue is created above; each thread joins a
-                    // unique consumer index.
-                    let consumer =
-                        unsafe { BroadcastConsumer::<Item>::join(&consumer_file) }.unwrap();
+                    // Each thread mints its own consumer lane from the one
+                    // shared `Broadcast` handle created above.
+                    let consumer = broadcast.consumer().unwrap();
                     run_broadcast_consumer(consumer, exit, consumer_reserve_failures);
                 })
                 .unwrap(),
@@ -435,7 +435,7 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
 
     for (idx, core_id) in producer_cores.into_iter().enumerate() {
         let exit = exit.clone();
-        let producer_file = queue_file.try_clone().unwrap();
+        let broadcast = broadcast.clone();
         let report_prefix = verbose.then(|| format!("Producer {idx}"));
         let total_items_produced = total_items_produced.clone();
         let producer_reserve_failures = producer_reserve_failures.clone();
@@ -448,10 +448,9 @@ fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
                         core_affinity::set_for_current(core_id);
                     }
 
-                    // SAFETY: the queue is created above; each thread joins a
-                    // unique lane.
-                    let producer =
-                        unsafe { BroadcastProducer::<Item>::join(&producer_file) }.unwrap();
+                    // Each thread mints its own producer lane from the one
+                    // shared `Broadcast` handle created above.
+                    let producer = broadcast.producer().unwrap();
                     run_broadcast_producer(
                         producer,
                         exit,
