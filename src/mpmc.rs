@@ -11,7 +11,7 @@ use core::{
     iter::FusedIterator,
     marker::PhantomData,
     mem::{ManuallyDrop, MaybeUninit},
-    ops::Index,
+    ops::{Index, Range},
     ptr::NonNull,
     sync::atomic::Ordering,
 };
@@ -322,7 +322,7 @@ impl<T> Consumer<T> {
     #[must_use]
     pub fn try_reserve_read_batch(&self, max: NonZeroUsize) -> Option<ReadBatch<'_, T>> {
         // SAFETY: ReadBatch drops all values that are not moved out through its
-        // sequential drain before the raw reservation is released.
+        // consuming iterator before the raw reservation is released.
         let raw = unsafe { self.try_reserve_read_batch_raw(max) }?;
         Some(ReadBatch { raw })
     }
@@ -1002,13 +1002,9 @@ pub struct WriteBatch<'a, T> {
 }
 
 impl<'a, T> WriteBatch<'a, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        // count is guaranteed to be non-zero by the type, so this batch can never be empty.
-        false
     }
 
     /// Returns a mutable reference to the reserved slot.
@@ -1070,13 +1066,9 @@ pub struct RawReadBatch<'a, T> {
 }
 
 impl<'a, T> RawReadBatch<'a, T> {
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.count.get()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        // count is guaranteed to be non-zero by the type, so this batch can never be empty.
-        false
     }
 
     /// Returns a reference to the reserved slot.
@@ -1126,9 +1118,9 @@ impl<'a, T> Drop for RawReadBatch<'a, T> {
 /// A destructor-safe reservation for consecutive initialized consumer slots.
 ///
 /// The batch keeps all of its slots reserved while it lives. It may be
-/// inspected without consuming values, and [`Self::drain`] converts it into a
-/// sequential consuming iterator. Dropping the batch without draining it drops
-/// every value before releasing the reservation.
+/// inspected without consuming values or converted into a sequential consuming
+/// iterator. Dropping the batch without consuming it drops every value before
+/// releasing the reservation.
 pub struct ReadBatch<'a, T> {
     raw: RawReadBatch<'a, T>,
 }
@@ -1138,12 +1130,9 @@ impl<'a, T> ReadBatch<'a, T> {
         &self.raw
     }
 
+    #[allow(clippy::len_without_is_empty)]
     pub fn len(&self) -> usize {
         self.raw().len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        false
     }
 
     /// Returns a shared reference to the value at `index`, or `None` if it is
@@ -1157,28 +1146,92 @@ impl<'a, T> ReadBatch<'a, T> {
         Some(unsafe { self.raw().get_unchecked(index) })
     }
 
+    /// Returns the values in logical read order as two slices.
+    ///
+    /// The second slice is empty unless the batch wraps around the end of the
+    /// queue buffer. This borrows the values without consuming the batch.
+    pub fn as_slices(&self) -> (&[T], &[T]) {
+        let start = self.raw.start & self.raw.buffer_mask;
+        let capacity = self.raw.buffer_mask.wrapping_add(1);
+        let first_len = self.len().min(capacity.wrapping_sub(start));
+        let second_len = self.len().wrapping_sub(first_len);
+
+        // SAFETY: `start` is within the queue buffer.
+        let first = unsafe { self.raw.buffer.add(start) };
+        let first = NonNull::slice_from_raw_parts(first, first_len);
+        // SAFETY: The first part of the reservation is initialized, contiguous,
+        // and remains reserved for the lifetime of the returned slice.
+        let first = unsafe { first.as_ref() };
+        let second = NonNull::slice_from_raw_parts(self.raw.buffer, second_len);
+        // SAFETY: The wrapped part of the reservation starts at the buffer base,
+        // is initialized and contiguous, and remains reserved for the lifetime
+        // of the returned slice.
+        let second = unsafe { second.as_ref() };
+        (first, second)
+    }
+
     /// Iterates over shared references without consuming any values.
     ///
     /// The batch reservation remains held for the iterator's lifetime.
-    pub fn iter(
-        &self,
-    ) -> impl DoubleEndedIterator<Item = &T> + ExactSizeIterator + FusedIterator + '_ {
-        (0..self.len()).map(|index| {
-            // SAFETY: The safe batch has not moved out any values, and the
-            // range only produces indices within the reservation.
-            unsafe { self.raw().get_unchecked(index) }
-        })
+    pub fn iter(&self) -> ReadBatchIter<'_, 'a, T> {
+        self.into_iter()
     }
+}
+
+impl<'batch, 'queue, T> IntoIterator for &'batch ReadBatch<'queue, T> {
+    type Item = &'batch T;
+    type IntoIter = ReadBatchIter<'batch, 'queue, T>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        ReadBatchIter {
+            batch: self,
+            range: 0..self.len(),
+        }
+    }
+}
+
+/// An iterator over shared references to the values in a read batch.
+#[must_use]
+pub struct ReadBatchIter<'batch, 'queue, T> {
+    batch: &'batch ReadBatch<'queue, T>,
+    range: Range<usize>,
+}
+
+impl<'batch, T> Iterator for ReadBatchIter<'batch, '_, T> {
+    type Item = &'batch T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.batch.get(self.range.next()?)
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        self.range.size_hint()
+    }
+}
+
+impl<T> DoubleEndedIterator for ReadBatchIter<'_, '_, T> {
+    fn next_back(&mut self) -> Option<Self::Item> {
+        self.batch.get(self.range.next_back()?)
+    }
+}
+
+impl<T> ExactSizeIterator for ReadBatchIter<'_, '_, T> {}
+impl<T> FusedIterator for ReadBatchIter<'_, '_, T> {}
+
+impl<'a, T> IntoIterator for ReadBatch<'a, T> {
+    type Item = T;
+    type IntoIter = ReadBatchIntoIter<'a, T>;
 
     /// Converts the batch into a sequential consuming iterator.
     ///
-    /// The returned drain keeps the complete batch reservation held. Dropping
-    /// it before exhaustion drops all values that have not yet been yielded.
-    pub fn drain(self) -> ReadBatchDrain<'a, T> {
+    /// The returned iterator keeps the complete batch reservation held.
+    /// Dropping it before exhaustion drops all values that have not yet been
+    /// yielded.
+    fn into_iter(self) -> Self::IntoIter {
         let batch = ManuallyDrop::new(self);
         // SAFETY: `batch` is not dropped, so this moves its raw guard exactly once.
         let raw = unsafe { core::ptr::read(&batch.raw) };
-        ReadBatchDrain { raw, next: 0 }
+        ReadBatchIntoIter { raw, next: 0 }
     }
 }
 
@@ -1218,12 +1271,12 @@ impl<T> Drop for ReadBatch<'_, T> {
 /// This iterator keeps the complete batch reservation held until it is
 /// dropped. Dropping it before exhaustion drops the unconsumed suffix before
 /// releasing the reservation.
-pub struct ReadBatchDrain<'a, T> {
+pub struct ReadBatchIntoIter<'a, T> {
     raw: RawReadBatch<'a, T>,
     next: usize,
 }
 
-impl<T> Iterator for ReadBatchDrain<'_, T> {
+impl<T> Iterator for ReadBatchIntoIter<'_, T> {
     type Item = T;
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -1243,10 +1296,10 @@ impl<T> Iterator for ReadBatchDrain<'_, T> {
     }
 }
 
-impl<T> ExactSizeIterator for ReadBatchDrain<'_, T> {}
-impl<T> FusedIterator for ReadBatchDrain<'_, T> {}
+impl<T> ExactSizeIterator for ReadBatchIntoIter<'_, T> {}
+impl<T> FusedIterator for ReadBatchIntoIter<'_, T> {}
 
-impl<T> Drop for ReadBatchDrain<'_, T> {
+impl<T> Drop for ReadBatchIntoIter<'_, T> {
     fn drop(&mut self) {
         if !core::mem::needs_drop::<T>() {
             return;
@@ -1435,6 +1488,14 @@ mod tests {
             }
             assert_eq!(batch.get(batch.len()), None);
             assert_eq!(batch.get_owned(batch.len()), None);
+            let (first, second) = batch.as_slices();
+            assert_eq!(first, &[0, 1, 2, 3]);
+            assert!(second.is_empty());
+            let mut borrowed = Vec::new();
+            for value in &batch {
+                borrowed.push(*value);
+            }
+            assert_eq!(borrowed, vec![0, 1, 2, 3]);
         }
     }
 
@@ -1516,7 +1577,7 @@ mod tests {
     }
 
     #[test]
-    fn read_batch_drain_drop_drops_only_unconsumed_values() {
+    fn read_batch_into_iter_drop_drops_only_unconsumed_values() {
         for create_queue in test_queue_creators::<CountedItem>() {
             let drops = Arc::new(AtomicUsize::new(0));
             let (producer, consumer) = create_queue(4);
@@ -1527,15 +1588,15 @@ mod tests {
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(4).unwrap())
                 .expect("read batch");
-            let mut drain = batch.drain();
-            assert_eq!(drain.len(), 3);
-            let first = drain.next().expect("first value");
+            let mut iter = batch.into_iter();
+            assert_eq!(iter.len(), 3);
+            let first = iter.next().expect("first value");
             assert_eq!(first.value, 0);
-            assert_eq!(drain.len(), 2);
+            assert_eq!(iter.len(), 2);
             drop(first);
             assert_eq!(drops.load(Ordering::Relaxed), 1);
 
-            drop(drain);
+            drop(iter);
             assert_eq!(drops.load(Ordering::Relaxed), 3);
             assert!(consumer.try_read().is_none());
             for value in 3..7 {
@@ -1549,7 +1610,7 @@ mod tests {
     }
 
     #[test]
-    fn copy_read_batch_supports_wrapped_random_access_and_drain() {
+    fn copy_read_batch_supports_wrapped_random_access_and_into_iter() {
         for create_queue in test_queue_creators::<Item>() {
             let (producer, consumer) = create_queue(4);
             assert!(producer.try_write_slice(&[0, 1, 2]));
@@ -1563,8 +1624,15 @@ mod tests {
             assert_eq!(batch.get_owned(3), Some(5));
             assert_eq!(batch.get_owned(0), Some(2));
             assert_eq!(batch.get_owned(3), Some(5));
+            let (first, second) = batch.as_slices();
+            assert_eq!(first, &[2, 3]);
+            assert_eq!(second, &[4, 5]);
             assert_eq!(batch.iter().copied().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
-            assert_eq!(batch.drain().collect::<Vec<_>>(), vec![2, 3, 4, 5]);
+            let mut values = Vec::new();
+            for value in batch {
+                values.push(value);
+            }
+            assert_eq!(values, vec![2, 3, 4, 5]);
         }
     }
 
