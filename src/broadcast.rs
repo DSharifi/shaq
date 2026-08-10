@@ -870,7 +870,7 @@ impl<T: Copy> Drop for Producer<T> {
 unsafe impl<T: Copy + Send> Send for Producer<T> {}
 
 /// A reservation of one cell in a producer's lane. Write it via
-/// [`Self::write`]/[`Self::as_mut_ref`], then drop the guard to publish it.
+/// [`Self::write`]/[`Self::as_mut`], then drop the guard to publish it.
 #[must_use]
 pub struct WriteGuard<'a, T: Copy> {
     producer: &'a mut Producer<T>,
@@ -903,7 +903,7 @@ impl<T: Copy> Drop for WriteGuard<'_, T> {
 }
 
 /// A reservation of `count` cells in a producer's lane. Write every cell via
-/// [`Self::write`]/[`Self::as_mut_ref`], then drop the batch to publish them.
+/// [`Self::write`]/[`Self::as_mut`], then drop the batch to publish them.
 #[must_use]
 pub struct WriteBatch<'a, T: Copy> {
     producer: &'a mut Producer<T>,
