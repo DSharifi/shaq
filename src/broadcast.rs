@@ -659,51 +659,58 @@ impl SharedQueue {
     }
 
     /// Pointer to producer lane block `lane`.
-    fn lane_block(&self, lane: usize) -> NonNull<u8> {
-        debug_assert!(lane < self.producer_slots);
-        // SAFETY: `lane < producer_slots`; blocks are `block_stride` apart.
+    ///
+    /// # Safety:
+    /// - `lane` must be in range (0..self.producer_slots)
+    unsafe fn lane_block(&self, lane: usize) -> NonNull<u8> {
+        // SAFETY: caller guarantees `lane < producer_slots`; blocks
+        // are `block_stride` apart.
         unsafe {
             self.producer_blocks
                 .byte_add(lane.wrapping_mul(self.block_stride))
         }
     }
 
-    /// Borrows the header at producer lane `lane`.
-    fn lane_header(&self, lane: usize) -> &LaneHeader {
-        let block = self.lane_block(lane);
-        // SAFETY: every producer block begins with an initialized `LaneHeader`,
-        // and the returned reference is tied to `&self`, whose `Arc<Region>`
-        // keeps the mapping alive.
-        unsafe { block.cast::<LaneHeader>().as_ref() }
-    }
-
-    /// A view over producer lane `lane`.
-    fn lane(&self, lane: usize) -> ProducerLane {
-        let block = self.lane_block(lane);
-        // SAFETY: the block was initialized with these parameters.
-        unsafe {
-            ProducerLane::from_block(block, self.capacity, self.consumer_slots(), self.payload)
-        }
+    /// Every producer lane on this queue, in order.
+    fn producer_lanes(&self) -> impl Iterator<Item = ProducerLane> + '_ {
+        (0..self.producer_slots).map(|lane_index| {
+            // SAFETY: lane_index is in range (0..self.producer_slots)
+            let block = unsafe { self.lane_block(lane_index) };
+            // SAFETY: the block was initialized with these parameters.
+            unsafe {
+                ProducerLane::from_block(block, self.capacity, self.consumer_slots(), self.payload)
+            }
+        })
     }
 
     /// Borrows metadata for the given `lane_index`.
     /// Returns [`None`] if `lane_index` is out of range or no producer has completed
     /// an acquisition of that lane.
     fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata<'_>> {
-        if lane_index >= self.producer_slots() {
+        let lane_index_is_valid = lane_index < self.producer_slots;
+        if !lane_index_is_valid {
             return None;
         }
-        LaneMetadata::try_new(self.lane_header(lane_index), LaneIndex::new(lane_index))
+        // SAFETY: lane_index is checked to in range above
+        let block = unsafe { self.lane_block(lane_index) };
+
+        // SAFETY: every producer block begins with an initialized `LaneHeader`,
+        // and the returned reference is tied to `&self`, whose `Arc<Region>`
+        // keeps the mapping alive.
+        let lane_header = unsafe { block.cast::<LaneHeader>().as_ref() };
+
+        LaneMetadata::try_new(lane_header, LaneIndex::new(lane_index))
     }
 
-    /// Claims a free producer lane, returning its index.
-    fn acquire_producer_lane(&self, producer_id: ProducerId) -> Result<usize, Error> {
-        for lane in 0..self.producer_slots {
-            if self.lane(lane).try_acquire(producer_id) {
-                return Ok(lane);
-            }
-        }
-        Err(Error::ProducerSlotsExhausted)
+    /// Claims a free producer lane, returning its index and cached view.
+    fn acquire_producer_lane(
+        &self,
+        producer_id: ProducerId,
+    ) -> Result<(usize, ProducerLane), Error> {
+        self.producer_lanes()
+            .enumerate()
+            .find(|(_, lane)| lane.try_acquire(producer_id))
+            .ok_or(Error::ProducerSlotsExhausted)
     }
 
     #[inline]
@@ -872,8 +879,7 @@ impl<T: Copy> Producer<T> {
     }
 
     fn from_queue(queue: SharedQueue, producer_id: ProducerId) -> Result<Self, Error> {
-        let index = queue.acquire_producer_lane(producer_id)?;
-        let lane = queue.lane(index);
+        let (index, lane) = queue.acquire_producer_lane(producer_id)?;
 
         Ok(Self {
             queue,
@@ -1112,9 +1118,7 @@ impl ConsumerCore {
         let index = queue.acquire_consumer_index()?;
         // Cache a view per lane (independent of `queue`) and join each at its
         // reservation frontier.
-        let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
-            .map(|lane| queue.lane(lane))
-            .collect();
+        let lanes: Box<[ProducerLane]> = queue.producer_lanes().collect();
         let next_by_lane = lanes
             .iter()
             .map(|lane| Self::join_lane(lane, index))
@@ -1134,9 +1138,7 @@ impl ConsumerCore {
             return Err(Error::InvalidIndex);
         }
         let recovery_mode = queue.begin_consumer_recovery(index);
-        let lanes: Box<[ProducerLane]> = (0..queue.producer_slots())
-            .map(|lane| queue.lane(lane))
-            .collect();
+        let lanes: Box<[ProducerLane]> = queue.producer_lanes().collect();
         let next_by_lane = match recovery_mode {
             ConsumerRecoveryMode::Resume => lanes
                 .iter()
@@ -1164,8 +1166,8 @@ impl ConsumerCore {
         if index >= queue.consumer_slots() {
             return Err(Error::InvalidIndex);
         }
-        for lane in 0..queue.producer_slots() {
-            queue.lane(lane).consumer_state().release(index);
+        for producer_lane in queue.producer_lanes() {
+            producer_lane.consumer_state().release(index);
         }
         queue.release_consumer_index(index);
         Ok(())
@@ -1190,7 +1192,6 @@ impl ConsumerCore {
     }
 
     /// Returns metadata for a lane containing a published value.
-    #[inline]
     fn lane_metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
         self.lane(lane.get()).metadata(lane)
     }
@@ -3120,7 +3121,7 @@ mod tests {
         // position recorded (next-to-read = 1). Build that state directly (claim
         // the index, join, record the cursor) so nothing releases the slot.
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        let lane = queue.producer_lanes().next().unwrap();
         ConsumerCore::join_lane(&lane, index);
         queue.activate_consumer_index(index);
 
@@ -3148,7 +3149,7 @@ mod tests {
         };
         let queue = recovery_queue(&config);
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        let lane = queue.producer_lanes().next().unwrap();
         let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
 
         // The consumer sampled reservation 0, then the producer filled the ring
@@ -3182,7 +3183,7 @@ mod tests {
         // The only consumer index is claimed and the lane's limit recorded, then
         // its owner "crashes" (no release).
         let index = queue.acquire_consumer_index().unwrap();
-        let lane = queue.lane(0);
+        let lane = queue.producer_lanes().next().unwrap();
         ConsumerCore::join_lane(&lane, index);
         queue.activate_consumer_index(index);
         let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
@@ -3199,8 +3200,8 @@ mod tests {
 
         // Force-release frees it (clear limits + free the index); a fresh join
         // then reclaims it at the current reservation frontier.
-        for lane in 0..queue.producer_slots() {
-            queue.lane(lane).consumer_state().release(index);
+        for lane in queue.producer_lanes() {
+            lane.consumer_state().release(index);
         }
         queue.release_consumer_index(index);
         let mut fresh = Consumer::from_queue(queue.clone()).unwrap();
