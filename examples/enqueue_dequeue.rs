@@ -15,6 +15,7 @@ use shaq::{
     spsc::{Consumer as SpscConsumer, Producer as SpscProducer},
 };
 use std::{
+    num::NonZeroUsize,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -26,12 +27,18 @@ const QUEUE_SIZE: usize = 16 * 1024 * 1024;
 
 /// Per-lane ring capacity (in items) for the broadcast queue; each producer
 /// gets its own ring of this size.
-const BROADCAST_CAPACITY: usize = 16 * 1024;
+const BROADCAST_CAPACITY: NonZeroUsize = NonZeroUsize::new(16 * 1024).unwrap();
 
 enum Mode {
     Spsc,
-    Mpmc { producers: usize, consumers: usize },
-    Broadcast { producers: usize, consumers: usize },
+    Mpmc {
+        producers: usize,
+        consumers: usize,
+    },
+    Broadcast {
+        producers: NonZeroUsize,
+        consumers: usize,
+    },
 }
 
 struct Config {
@@ -94,7 +101,7 @@ fn parse_config_or_exit() -> Config {
             }
         }
         Some("broadcast") => {
-            let producers = parse_usize_arg(positional.get(1).cloned(), 2, "producers");
+            let producers = parse_non_zero_usize_arg(positional.get(1).cloned(), 2, "producers");
             let consumers = parse_usize_arg(positional.get(2).cloned(), 2, "consumers");
             if positional.len() > 3 {
                 eprintln!("Too many arguments for broadcast mode");
@@ -125,6 +132,13 @@ fn parse_usize_arg(value: Option<String>, default: usize, name: &str) -> usize {
             })
         })
         .unwrap_or(default)
+}
+
+fn parse_non_zero_usize_arg(value: Option<String>, default: usize, name: &str) -> NonZeroUsize {
+    NonZeroUsize::new(parse_usize_arg(value, default, name)).unwrap_or_else(|| {
+        eprintln!("Invalid {name}: value must be greater than zero");
+        std::process::exit(2);
+    })
 }
 
 fn print_usage() {
@@ -376,9 +390,9 @@ fn run_mpmc_consumer(
     });
 }
 
-fn run_broadcast(producers: usize, consumers: usize, verbose: bool) {
+fn run_broadcast(producers: NonZeroUsize, consumers: usize, verbose: bool) {
     // Every consumer sees every producer's items, so reuse the mpmc core layout.
-    let (consumer_cores, producer_cores) = mpmc_core_ids(consumers, producers);
+    let (consumer_cores, producer_cores) = mpmc_core_ids(consumers, producers.get());
     let exit = setup_exit_handler();
     let queue_path = "/tmp/shaq_broadcast";
     let queue_file = prepare_queue_file(queue_path);

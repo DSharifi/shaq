@@ -85,10 +85,11 @@ const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 /// Runtime configuration for a broadcast queue.
 ///
 /// `capacity` is the per-lane ring capacity (rounded up to a power of two);
-/// `producer_slots` / `consumer_slots` bound the lanes / consumers.
+/// `producer_slots` / `consumer_slots` bound the lanes / consumers. A queue may
+/// have no consumer slots, in which case producers run without backpressure.
 pub struct BroadcastConfig {
-    pub capacity: usize,
-    pub producer_slots: usize,
+    pub capacity: NonZeroUsize,
+    pub producer_slots: NonZeroUsize,
     pub consumer_slots: usize,
 }
 
@@ -207,10 +208,11 @@ impl Broadcast<UnknownType> {
     /// ```
     /// use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
     /// use std::fs::OpenOptions;
+    /// # use std::num::NonZeroUsize;
     ///
     /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-untyped", std::process::id()));
     /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
-    /// # let config = BroadcastConfig { capacity: 4, producer_slots: 1, consumer_slots: 1 };
+    /// # let config = BroadcastConfig { capacity: NonZeroUsize::new(4).unwrap(), producer_slots: NonZeroUsize::new(1).unwrap(), consumer_slots: 1 };
     /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
     /// #
     /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
@@ -225,9 +227,10 @@ impl Broadcast<UnknownType> {
     /// ```compile_fail
     /// # use shaq::broadcast::{Broadcast, BroadcastConfig, ProducerId, UnknownType};
     /// # use std::fs::OpenOptions;
+    /// # use std::num::NonZeroUsize;
     /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-producer", std::process::id()));
     /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
-    /// # let config = BroadcastConfig { capacity: 4, producer_slots: 1, consumer_slots: 1 };
+    /// # let config = BroadcastConfig { capacity: NonZeroUsize::new(4).unwrap(), producer_slots: NonZeroUsize::new(1).unwrap(), consumer_slots: 1 };
     /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
     /// #
     /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
@@ -237,9 +240,10 @@ impl Broadcast<UnknownType> {
     /// ```compile_fail
     /// # use shaq::broadcast::{Broadcast, BroadcastConfig, UnknownType};
     /// # use std::fs::OpenOptions;
+    /// # use std::num::NonZeroUsize;
     /// # let path = std::env::temp_dir().join(format!("shaq-doctest-{}-consumer", std::process::id()));
     /// # let file = OpenOptions::new().read(true).write(true).create(true).truncate(true).open(&path).unwrap();
-    /// # let config = BroadcastConfig { capacity: 4, producer_slots: 1, consumer_slots: 1 };
+    /// # let config = BroadcastConfig { capacity: NonZeroUsize::new(4).unwrap(), producer_slots: NonZeroUsize::new(1).unwrap(), consumer_slots: 1 };
     /// # unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
     /// #
     /// let broadcast = unsafe { Broadcast::join_untyped(&file) }.unwrap();
@@ -444,10 +448,7 @@ impl QueueLayout {
         if payload.align() > ProducerLane::block_align() {
             return None;
         }
-        if config.capacity == 0 {
-            return None;
-        }
-        let capacity = config.capacity.checked_next_power_of_two()?;
+        let capacity = config.capacity.get().checked_next_power_of_two()?;
         if capacity > u32::MAX as usize {
             return None;
         }
@@ -455,8 +456,7 @@ impl QueueLayout {
         // can constrain the reserve limit), useful for measuring a producer in
         // isolation. `producer_slots` must be at least one — a queue with no
         // lanes can hold nothing.
-        if config.producer_slots == 0
-            || config.producer_slots > u32::MAX as usize
+        if config.producer_slots.get() > u32::MAX as usize
             || config.consumer_slots > u32::MAX as usize
         {
             return None;
@@ -474,12 +474,12 @@ impl QueueLayout {
         let block_stride =
             producer_lane::block_size_for_payload(capacity, config.consumer_slots, payload)?
                 .checked_next_multiple_of(block_align)?;
-        let producer_blocks_bytes = block_stride.checked_mul(config.producer_slots)?;
+        let producer_blocks_bytes = block_stride.checked_mul(config.producer_slots.get())?;
         let total = producer_blocks_offset.checked_add(producer_blocks_bytes)?;
 
         Some(Self {
             capacity,
-            producer_slots: config.producer_slots,
+            producer_slots: config.producer_slots.get(),
             consumer_slots: config.consumer_slots,
             payload_layout: payload,
             consumer_state_offset,
@@ -518,8 +518,9 @@ impl QueueLayout {
     ) -> Result<Self, Error> {
         let capacity = header.capacity as usize;
         let config = BroadcastConfig {
-            capacity,
-            producer_slots: header.producer_slots as usize,
+            capacity: NonZeroUsize::new(capacity).ok_or(Error::InvalidBufferSize)?,
+            producer_slots: NonZeroUsize::new(header.producer_slots as usize)
+                .ok_or(Error::InvalidBufferSize)?,
             consumer_slots: header.consumer_slots as usize,
         };
         // `capacity` is already a power of two, so the recomputed layout must
@@ -1881,6 +1882,10 @@ mod tests {
     /// Placeholder id for tests that don't assert on producer metadata.
     const BOGUS_ID: ProducerId = ProducerId::new(1111);
 
+    const fn non_zero(value: usize) -> NonZeroUsize {
+        NonZeroUsize::new(value).unwrap()
+    }
+
     type CreateProducer = fn(BroadcastConfig) -> Producer<Payload>;
     type CreateIdentifiedProducer = fn(BroadcastConfig, ProducerId) -> Producer<Payload>;
 
@@ -1943,8 +1948,8 @@ mod tests {
     fn clones_until_lanes_exhausted() {
         for create in producer_creators() {
             let p0 = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 2,
+                capacity: non_zero(4),
+                producer_slots: non_zero(2),
                 consumer_slots: 1,
             });
             let broadcast = p0.broadcast_handle();
@@ -1968,8 +1973,8 @@ mod tests {
     fn try_write_publishes() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
+                capacity: non_zero(8),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -1986,8 +1991,8 @@ mod tests {
     fn write_batch_publishes_on_drop() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
+                capacity: non_zero(8),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2011,8 +2016,8 @@ mod tests {
     fn try_write_slice_publishes_all_items() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
+                capacity: non_zero(8),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2031,8 +2036,8 @@ mod tests {
         // No consumers: the producer overwrites freely past one revolution.
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             for value in 0..16u64 {
@@ -2045,8 +2050,8 @@ mod tests {
     fn zero_consumer_slots_lets_producer_run_free() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 0,
             });
             // No consumer can ever constrain the lane, so writes never block.
@@ -2068,8 +2073,8 @@ mod tests {
     #[test]
     fn join_rejects_uninitialized_file() {
         let config = BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let size = QueueLayout::new::<Payload>(&config).unwrap().total;
@@ -2083,8 +2088,8 @@ mod tests {
     #[test]
     fn header_records_payload_layout() {
         let config = BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
@@ -2099,8 +2104,8 @@ mod tests {
     #[test]
     fn typed_join_rejects_payload_layout_mismatch() {
         let config = BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let size = QueueLayout::new::<u64>(&config).expect("layout").total;
@@ -2122,8 +2127,8 @@ mod tests {
     #[test]
     fn slice_consumer_reads_payload_bytes() {
         let mut producer = create_heap_producer(BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         });
         // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
@@ -2144,8 +2149,8 @@ mod tests {
     #[test]
     fn slice_consumer_batch_reads_payload_bytes() {
         let mut producer = create_heap_producer(BroadcastConfig {
-            capacity: 8,
-            producer_slots: 1,
+            capacity: non_zero(8),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         });
         // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
@@ -2172,8 +2177,8 @@ mod tests {
     #[test]
     fn slice_consumer_joins_file_without_payload_type() {
         let config = BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let file = create_temp_shmem_file().expect("temp file");
@@ -2193,18 +2198,8 @@ mod tests {
     #[test]
     fn layout_rejects_oversized_capacity_without_panicking() {
         let config = BroadcastConfig {
-            capacity: usize::MAX,
-            producer_slots: 1,
-            consumer_slots: 1,
-        };
-        assert!(QueueLayout::new::<Payload>(&config).is_err());
-    }
-
-    #[test]
-    fn layout_rejects_zero_capacity() {
-        let config = BroadcastConfig {
-            capacity: 0,
-            producer_slots: 1,
+            capacity: non_zero(usize::MAX),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         assert!(QueueLayout::new::<Payload>(&config).is_err());
@@ -2214,8 +2209,8 @@ mod tests {
     fn every_consumer_observes_every_item_in_order() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
+                capacity: non_zero(8),
+                producer_slots: non_zero(1),
                 consumer_slots: 2,
             });
             // Both consumers join before anything is published, so they start at 0.
@@ -2254,8 +2249,8 @@ mod tests {
 
         for create in producer_creators() {
             let mut producer = create(BroadcastConfig {
-                capacity: 32,
-                producer_slots: 1,
+                capacity: non_zero(32),
+                producer_slots: non_zero(1),
                 consumer_slots: 2,
             });
             let consumers = [
@@ -2317,8 +2312,8 @@ mod tests {
     fn slow_consumer_backpressures_producer() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2340,8 +2335,8 @@ mod tests {
     fn read_guard_holds_cell_until_dropped() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2368,8 +2363,8 @@ mod tests {
     fn write_guard_publishes_on_drop_and_read_guard_reads() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2394,8 +2389,8 @@ mod tests {
     fn read_batch_is_bounded_and_commits_on_drop() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
+                capacity: non_zero(8),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2438,8 +2433,8 @@ mod tests {
     fn read_batch_holds_cells_until_dropped() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2466,8 +2461,8 @@ mod tests {
     fn read_batch_as_slices_supports_wrapping() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2492,8 +2487,8 @@ mod tests {
     fn consumer_joining_late_skips_earlier_items() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 8,
-                producer_slots: 1,
+                capacity: non_zero(8),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             for value in 0..3u64 {
@@ -2510,8 +2505,8 @@ mod tests {
     #[test]
     fn consumer_joining_during_unpublished_reservation_skips_it() {
         let config = BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
@@ -2536,8 +2531,8 @@ mod tests {
     fn reserve_read_timeout_times_out_then_observes_publication() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 2,
+                capacity: non_zero(4),
+                producer_slots: non_zero(2),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2564,8 +2559,8 @@ mod tests {
     fn reserve_read_timeout_blocks_in_futex_then_times_out() {
         for create in producer_creators() {
             let p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 2,
+                capacity: non_zero(4),
+                producer_slots: non_zero(2),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2580,8 +2575,8 @@ mod tests {
     fn read_and_batch_timeout_observe_publication() {
         for create in producer_creators() {
             let mut p = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let mut c = p.broadcast_handle().consumer().unwrap();
@@ -2616,8 +2611,8 @@ mod tests {
     fn broadcast_reports_the_configured_lane_count() {
         for create in producer_creators() {
             let producer = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 2,
+                capacity: non_zero(4),
+                producer_slots: non_zero(2),
                 consumer_slots: 1,
             });
 
@@ -2633,8 +2628,8 @@ mod tests {
             let producer_id = ProducerId::new(42);
             let producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 1,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(1),
                     consumer_slots: 1,
                 },
                 producer_id,
@@ -2652,8 +2647,8 @@ mod tests {
             let producer_id = ProducerId::new(42);
             let producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 1,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(1),
                     consumer_slots: 1,
                 },
                 producer_id,
@@ -2674,8 +2669,8 @@ mod tests {
             let producer_id = ProducerId::new(42);
             let producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 1,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(1),
                     consumer_slots: 1,
                 },
                 producer_id,
@@ -2695,8 +2690,8 @@ mod tests {
     fn owned_lane_metadata_starts_with_no_rejected_items() {
         for create in producer_creators() {
             let producer = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let broadcast = producer.broadcast_handle();
@@ -2714,8 +2709,8 @@ mod tests {
     fn never_owned_lane_has_no_metadata() {
         for create in producer_creators() {
             let producer = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 2,
+                capacity: non_zero(4),
+                producer_slots: non_zero(2),
                 consumer_slots: 1,
             });
             let broadcast = producer.broadcast_handle();
@@ -2730,8 +2725,8 @@ mod tests {
     fn rejected_items_count_writes_refused_by_backpressure() {
         for create in producer_creators() {
             let mut producer = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let broadcast = producer.broadcast_handle();
@@ -2758,8 +2753,8 @@ mod tests {
         for create in identified_producer_creators() {
             let idle_producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 2,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(2),
                     consumer_slots: 1,
                 },
                 ProducerId::new(41),
@@ -2782,8 +2777,8 @@ mod tests {
         for create in identified_producer_creators() {
             let idle_producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 2,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(2),
                     consumer_slots: 1,
                 },
                 ProducerId::new(41),
@@ -2805,8 +2800,8 @@ mod tests {
     fn lane_metadata_is_none_for_an_out_of_range_index() {
         for create in producer_creators() {
             let producer = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 2,
+                capacity: non_zero(4),
+                producer_slots: non_zero(2),
                 consumer_slots: 1,
             });
             let broadcast = producer.broadcast_handle();
@@ -2822,8 +2817,8 @@ mod tests {
         for create in identified_producer_creators() {
             let producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 1,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(1),
                     consumer_slots: 1,
                 },
                 ProducerId::new(42),
@@ -2843,8 +2838,8 @@ mod tests {
             let producer_id = ProducerId::new(42);
             let producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 1,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(1),
                     consumer_slots: 1,
                 },
                 producer_id,
@@ -2864,8 +2859,8 @@ mod tests {
     fn retired_lane_metadata_keeps_the_rejected_items_count() {
         for create in producer_creators() {
             let mut producer = create(BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             });
             let broadcast = producer.broadcast_handle();
@@ -2890,8 +2885,8 @@ mod tests {
         for create in identified_producer_creators() {
             let idle_producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 2,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(2),
                     consumer_slots: 1,
                 },
                 ProducerId::new(41),
@@ -2916,8 +2911,8 @@ mod tests {
         for create in identified_producer_creators() {
             let idle_producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 2,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(2),
                     consumer_slots: 1,
                 },
                 ProducerId::new(41),
@@ -2942,8 +2937,8 @@ mod tests {
         for create in identified_producer_creators() {
             let idle_producer = create(
                 BroadcastConfig {
-                    capacity: 4,
-                    producer_slots: 2,
+                    capacity: non_zero(4),
+                    producer_slots: non_zero(2),
                     consumer_slots: 1,
                 },
                 ProducerId::new(41),
@@ -2967,8 +2962,8 @@ mod tests {
     fn untyped_broadcast_exposes_lane_metadata() {
         let producer = create_identified_heap_producer(
             BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             },
             ProducerId::new(42),
@@ -2986,8 +2981,8 @@ mod tests {
     fn slice_read_guard_reports_the_source_lane() {
         let mut producer = create_identified_heap_producer(
             BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             },
             ProducerId::new(42),
@@ -3007,8 +3002,8 @@ mod tests {
     fn slice_read_guard_reports_the_source_producer_id() {
         let mut producer = create_identified_heap_producer(
             BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             },
             ProducerId::new(42),
@@ -3028,8 +3023,8 @@ mod tests {
     fn slice_read_batch_reports_the_source_lane() {
         let mut producer = create_identified_heap_producer(
             BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             },
             ProducerId::new(42),
@@ -3051,8 +3046,8 @@ mod tests {
     fn slice_read_batch_reports_the_source_producer_id() {
         let mut producer = create_identified_heap_producer(
             BroadcastConfig {
-                capacity: 4,
-                producer_slots: 1,
+                capacity: non_zero(4),
+                producer_slots: non_zero(1),
                 consumer_slots: 1,
             },
             ProducerId::new(42),
@@ -3082,8 +3077,8 @@ mod tests {
     #[test]
     fn dropped_producer_lane_stays_readable() {
         let config = BroadcastConfig {
-            capacity: 8,
-            producer_slots: 1,
+            capacity: non_zero(8),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
@@ -3111,8 +3106,8 @@ mod tests {
     #[test]
     fn recover_consumer_resumes_from_last_position() {
         let config = BroadcastConfig {
-            capacity: 8,
-            producer_slots: 1,
+            capacity: non_zero(8),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
@@ -3143,8 +3138,8 @@ mod tests {
     #[test]
     fn recover_consumer_restarts_an_interrupted_join() {
         let config = BroadcastConfig {
-            capacity: 4,
-            producer_slots: 1,
+            capacity: non_zero(4),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
@@ -3174,8 +3169,8 @@ mod tests {
     #[test]
     fn force_release_consumer_frees_the_index_for_a_fresh_join() {
         let config = BroadcastConfig {
-            capacity: 8,
-            producer_slots: 1,
+            capacity: non_zero(8),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
@@ -3216,8 +3211,8 @@ mod tests {
     #[test]
     fn recover_rejects_out_of_range_index() {
         let config = BroadcastConfig {
-            capacity: 8,
-            producer_slots: 1,
+            capacity: non_zero(8),
+            producer_slots: non_zero(1),
             consumer_slots: 1,
         };
         let queue = recovery_queue(&config);
@@ -3231,8 +3226,8 @@ mod tests {
     #[test]
     fn broadcast_create_clone_and_join_share_all_lanes() {
         let config = BroadcastConfig {
-            capacity: 8,
-            producer_slots: 2,
+            capacity: non_zero(8),
+            producer_slots: non_zero(2),
             consumer_slots: 1,
         };
         let file = create_temp_shmem_file().expect("temp file");
@@ -3258,8 +3253,8 @@ mod tests {
     #[test]
     fn every_endpoint_exposes_its_broadcast() {
         let mut p0 = create_heap_producer(BroadcastConfig {
-            capacity: 8,
-            producer_slots: 2,
+            capacity: non_zero(8),
+            producer_slots: non_zero(2),
             consumer_slots: 2,
         });
         let mut consumer = p0.broadcast_handle().consumer().unwrap();
