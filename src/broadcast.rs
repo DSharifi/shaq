@@ -86,6 +86,7 @@ const MAGIC: u64 = u64::from_be_bytes(*b"shaqcast");
 ///
 /// `capacity` is the per-lane ring capacity (rounded up to a power of two);
 /// `producer_slots` / `consumer_slots` bound the lanes / consumers.
+#[derive(Debug, Clone)]
 pub struct BroadcastConfig {
     pub capacity: usize,
     pub producer_slots: usize,
@@ -99,6 +100,14 @@ pub struct Broadcast<MessageType> {
     _payload_invariant: PhantomData<fn(MessageType) -> MessageType>,
 }
 
+impl<MessageType> core::fmt::Debug for Broadcast<MessageType> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Broadcast")
+            .field("producer_slots", &self.producer_slots())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<MessageType> Clone for Broadcast<MessageType> {
     fn clone(&self) -> Self {
         Self {
@@ -110,6 +119,7 @@ impl<MessageType> Clone for Broadcast<MessageType> {
 }
 
 /// Marker payload type for [`Broadcast::join_untyped`].
+#[derive(Debug)]
 pub struct UnknownType;
 
 impl<T> Broadcast<T>
@@ -843,6 +853,15 @@ pub struct Producer<T: Copy> {
     _invariant: PhantomData<fn(T) -> T>,
 }
 
+impl<T: Copy> core::fmt::Debug for Producer<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Producer")
+            .field("lane_index", &self.index())
+            .field("producer_id", &self.producer_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: Copy> Producer<T> {
     /// Creates a broadcast queue in `file` and joins as a producer.
     ///
@@ -990,6 +1009,15 @@ pub struct WriteGuard<'a, T: Copy> {
     start: usize,
 }
 
+impl<T: Copy> core::fmt::Debug for WriteGuard<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WriteGuard")
+            .field("lane_index", &self.producer.index())
+            .field("producer_id", &self.producer.producer_id())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: Copy> core::convert::AsMut<MaybeUninit<T>> for WriteGuard<'_, T> {
     /// Mutable reference to the reserved cell.
     fn as_mut(&mut self) -> &mut MaybeUninit<T> {
@@ -1022,6 +1050,16 @@ pub struct WriteBatch<'a, T: Copy> {
     producer: &'a mut Producer<T>,
     start: usize,
     count: NonZeroUsize,
+}
+
+impl<T: Copy> core::fmt::Debug for WriteBatch<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("WriteBatch")
+            .field("lane_index", &self.producer.index())
+            .field("producer_id", &self.producer.producer_id())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: Copy> WriteBatch<'_, T> {
@@ -1300,6 +1338,14 @@ pub struct Consumer<T: Copy> {
     _invariant: PhantomData<fn(T) -> T>,
 }
 
+impl<T: Copy> core::fmt::Debug for Consumer<T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("Consumer")
+            .field("consumer_index", &self.index())
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: Copy> Consumer<T> {
     /// Creates a broadcast queue in `file` and joins as a consumer.
     ///
@@ -1490,6 +1536,19 @@ pub struct ReadGuard<'a, T: Copy> {
     payload: NonNull<T>,
 }
 
+impl<T: Copy + core::fmt::Debug> core::fmt::Debug for ReadGuard<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let metadata = self.lane_metadata();
+        // SAFETY: the cell is published and held by this consumer's cursor.
+        let value = unsafe { self.payload.read() };
+        f.debug_struct("ReadGuard")
+            .field("lane_index", &metadata.lane())
+            .field("producer_id", &metadata.producer_id())
+            .field("value", &value)
+            .finish_non_exhaustive()
+    }
+}
+
 impl<T: Copy> ReadGuard<'_, T> {
     /// Metadata for the producer lane this value was published on.
     pub fn lane_metadata(&self) -> LaneMetadata<'_> {
@@ -1527,6 +1586,17 @@ pub struct ReadBatch<'a, T: Copy> {
     start: usize,
     count: NonZeroUsize,
     _marker: PhantomData<T>,
+}
+
+impl<T: Copy> core::fmt::Debug for ReadBatch<'_, T> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let metadata = self.lane_metadata();
+        f.debug_struct("ReadBatch")
+            .field("lane_index", &metadata.lane())
+            .field("producer_id", &metadata.producer_id())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
 }
 
 impl<T: Copy> ReadBatch<'_, T> {
@@ -1620,6 +1690,15 @@ impl<T: Copy> Drop for ReadBatch<'_, T> {
 /// with implicit padding.
 pub struct SliceConsumer {
     core: ConsumerCore,
+}
+
+impl core::fmt::Debug for SliceConsumer {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("SliceConsumer")
+            .field("consumer_index", &self.index())
+            .field("payload_size", &self.payload_size())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SliceConsumer {
@@ -1786,6 +1865,17 @@ pub struct SliceReadGuard<'a> {
     len: usize,
 }
 
+impl core::fmt::Debug for SliceReadGuard<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let metadata = self.lane_metadata();
+        f.debug_struct("SliceReadGuard")
+            .field("lane_index", &metadata.lane())
+            .field("producer_id", &metadata.producer_id())
+            .field("len", &self.len())
+            .finish_non_exhaustive()
+    }
+}
+
 impl SliceReadGuard<'_> {
     /// Metadata for the producer lane this payload was published on.
     pub fn lane_metadata(&self) -> LaneMetadata<'_> {
@@ -1829,6 +1919,18 @@ pub struct SliceReadBatch<'a> {
     start: usize,
     count: NonZeroUsize,
     payload_size: usize,
+}
+
+impl core::fmt::Debug for SliceReadBatch<'_> {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        let metadata = self.lane_metadata();
+        f.debug_struct("SliceReadBatch")
+            .field("lane_index", &metadata.lane())
+            .field("producer_id", &metadata.producer_id())
+            .field("len", &self.len())
+            .field("payload_size", &self.payload_size())
+            .finish_non_exhaustive()
+    }
 }
 
 impl SliceReadBatch<'_> {
@@ -1875,6 +1977,31 @@ mod tests {
     use super::*;
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
+
+    fn assert_debug<T: core::fmt::Debug>() {}
+
+    #[test]
+    fn public_debug_trait_bounds() {
+        #[derive(Clone, Copy)]
+        struct CopyOnly;
+        #[derive(Debug, Clone, Copy)]
+        struct DebugAndCopy;
+
+        assert_debug::<BroadcastConfig>();
+        assert_debug::<Broadcast<CopyOnly>>();
+        assert_debug::<UnknownType>();
+        assert_debug::<ProducerId>();
+        assert_debug::<LaneMetadata<'static>>();
+        assert_debug::<Producer<CopyOnly>>();
+        assert_debug::<WriteGuard<'static, CopyOnly>>();
+        assert_debug::<WriteBatch<'static, CopyOnly>>();
+        assert_debug::<Consumer<CopyOnly>>();
+        assert_debug::<ReadBatch<'static, CopyOnly>>();
+        assert_debug::<SliceConsumer>();
+        assert_debug::<SliceReadGuard<'static>>();
+        assert_debug::<SliceReadBatch<'static>>();
+        assert_debug::<ReadGuard<'static, DebugAndCopy>>();
+    }
 
     type Payload = u64;
 
