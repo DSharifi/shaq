@@ -75,7 +75,7 @@ use std::time::Duration;
 use crate::error::{Error, WaitError};
 use crate::futex::{Waiters, SPIN_ATTEMPTS};
 use crate::shmem::Region;
-use crate::{CacheAlignedAtomicSize, DEFAULT_QUEUE_ID, VERSION};
+use crate::{CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION};
 
 use consumer_state::{ConsumerRecoveryMode, ConsumerState};
 use producer_lane::{LaneHeader, ProducerLane};
@@ -135,8 +135,8 @@ where
     ///   value must be valid in every process that reads it. The `Copy` bound
     ///   does not make embedded pointers or references process-portable.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
-        // SAFETY: the caller upholds the same requirements as create_with_identity.
-        unsafe { Self::create_with_identity(file, config, DEFAULT_QUEUE_ID) }
+        // SAFETY: the caller upholds the same requirements as create_with_identifier.
+        unsafe { Self::create_with_identifier(file, config, DEFAULT_QUEUE_IDENTIFIER) }
     }
 
     /// Creates a broadcast queue in `file` with a caller chosen identifier.
@@ -144,7 +144,7 @@ where
     ///
     /// # Safety
     /// The same requirements as [`Self::create`] apply.
-    pub unsafe fn create_with_identity(
+    pub unsafe fn create_with_identifier(
         file: &File,
         config: BroadcastConfig,
         queue_identifier: u64,
@@ -2043,9 +2043,10 @@ mod tests {
         let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once here.
-        let queue =
-            unsafe { SharedQueue::create_in_region::<Payload>(&region, &config, DEFAULT_QUEUE_ID) }
-                .unwrap();
+        let queue = unsafe {
+            SharedQueue::create_in_region::<Payload>(&region, &config, DEFAULT_QUEUE_IDENTIFIER)
+        }
+        .unwrap();
         Producer::from_queue(queue, id).unwrap()
     }
 
@@ -2092,11 +2093,25 @@ mod tests {
     }
 
     #[cfg(not(miri))]
-    #[rstest::rstest]
-    #[case::zero(0)]
-    #[case::nonzero(42)]
-    #[case::max(u64::MAX)]
-    fn queue_identifier_returns_supplied_id(#[case] identifier: u64) {
+    #[test]
+    fn queue_identifier_returns_supplied_zero() {
+        assert_queue_identifier(0);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queue_identifier_returns_supplied_nonzero() {
+        assert_queue_identifier(42);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queue_identifier_returns_supplied_max() {
+        assert_queue_identifier(u64::MAX);
+    }
+
+    #[cfg(not(miri))]
+    fn assert_queue_identifier(identifier: u64) {
         let file = create_temp_shmem_file().expect("temp file");
         let config = BroadcastConfig {
             capacity: 4,
@@ -2105,7 +2120,7 @@ mod tests {
         };
         // SAFETY: fresh file, initialized once with process-portable u64 payloads.
         let broadcast =
-            unsafe { Broadcast::<u64>::create_with_identity(&file, config, identifier) }.unwrap();
+            unsafe { Broadcast::<u64>::create_with_identifier(&file, config, identifier) }.unwrap();
         assert_eq!(broadcast.queue_identifier(), identifier);
 
         // SAFETY: the file contains a live broadcast queue with u64 payloads.
@@ -2288,9 +2303,10 @@ mod tests {
         let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        let queue =
-            unsafe { SharedQueue::create_in_region::<Payload>(&region, &config, DEFAULT_QUEUE_ID) }
-                .unwrap();
+        let queue = unsafe {
+            SharedQueue::create_in_region::<Payload>(&region, &config, DEFAULT_QUEUE_IDENTIFIER)
+        }
+        .unwrap();
 
         assert_eq!(queue.header().payload_size, size_of::<Payload>());
         assert_eq!(queue.header().payload_align, align_of::<Payload>());
@@ -2306,7 +2322,7 @@ mod tests {
         let size = QueueLayout::new::<u64>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        unsafe { SharedQueue::create_in_region::<u64>(&region, &config, DEFAULT_QUEUE_ID) }
+        unsafe { SharedQueue::create_in_region::<u64>(&region, &config, DEFAULT_QUEUE_IDENTIFIER) }
             .unwrap();
 
         // Same payload size as `u64`, but different alignment.
@@ -3277,8 +3293,10 @@ mod tests {
         let size = QueueLayout::new::<Payload>(config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        unsafe { SharedQueue::create_in_region::<Payload>(&region, config, DEFAULT_QUEUE_ID) }
-            .unwrap()
+        unsafe {
+            SharedQueue::create_in_region::<Payload>(&region, config, DEFAULT_QUEUE_IDENTIFIER)
+        }
+        .unwrap()
     }
 
     #[test]

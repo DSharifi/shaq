@@ -5,7 +5,7 @@ use crate::{
     futex::{Waiters, SPIN_ATTEMPTS},
     normalized_capacity,
     shmem::Region,
-    CacheAlignedAtomicSize, DEFAULT_QUEUE_ID, VERSION,
+    CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
 };
 use core::{
     iter::FusedIterator,
@@ -50,8 +50,8 @@ impl<T> Producer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        // SAFETY: the caller upholds the same requirements as create_with_identity.
-        unsafe { Self::create_with_identity(file, file_size, DEFAULT_QUEUE_ID) }
+        // SAFETY: the caller upholds the same requirements as create_with_identifier.
+        unsafe { Self::create_with_identifier(file, file_size, DEFAULT_QUEUE_IDENTIFIER) }
     }
 
     /// Creates a shared queue in `file` with a caller chosen identifier.
@@ -59,7 +59,7 @@ impl<T> Producer<T> {
     ///
     /// # Safety
     /// The same requirements as [`Self::create`] apply.
-    pub unsafe fn create_with_identity(
+    pub unsafe fn create_with_identifier(
         file: &File,
         file_size: usize,
         queue_identifier: u64,
@@ -262,8 +262,8 @@ impl<T> Consumer<T> {
     /// - If a process may read, dereference, mutate, or drop a queued value,
     ///   that operation must be valid for that value in that process.
     pub unsafe fn create(file: &File, file_size: usize) -> Result<Self, Error> {
-        // SAFETY: the caller upholds the same requirements as create_with_identity.
-        unsafe { Self::create_with_identity(file, file_size, DEFAULT_QUEUE_ID) }
+        // SAFETY: the caller upholds the same requirements as create_with_identifier.
+        unsafe { Self::create_with_identifier(file, file_size, DEFAULT_QUEUE_IDENTIFIER) }
     }
 
     /// Creates a shared queue in `file` with a caller chosen identifier.
@@ -271,7 +271,7 @@ impl<T> Consumer<T> {
     ///
     /// # Safety
     /// The same requirements as [`Self::create`] apply.
-    pub unsafe fn create_with_identity(
+    pub unsafe fn create_with_identifier(
         file: &File,
         file_size: usize,
         queue_identifier: u64,
@@ -534,7 +534,8 @@ pub fn pair<T: Send>(capacity: usize) -> Result<(Producer<T>, Consumer<T>), Erro
     let region_size = minimum_region_size::<T>(capacity);
     let region = Region::alloc(NonZeroUsize::new(region_size).ok_or(Error::InvalidBufferSize)?)?;
     // SAFETY: `region` is freshly allocated and used only for this queue.
-    let header = unsafe { SharedQueueHeader::create_in_region::<T>(&region, DEFAULT_QUEUE_ID) }?;
+    let header =
+        unsafe { SharedQueueHeader::create_in_region::<T>(&region, DEFAULT_QUEUE_IDENTIFIER) }?;
     // SAFETY: `header` was just created in `region`, so it is valid, aligned,
     // and paired with that region.
     let producer = unsafe { Producer::from_header(region, header) }?;
@@ -1431,16 +1432,30 @@ mod tests {
     }
 
     #[cfg(not(miri))]
-    #[rstest::rstest]
-    #[case::zero(0)]
-    #[case::nonzero(42)]
-    #[case::max(u64::MAX)]
-    fn queue_identifier_returns_supplied_id(#[case] identifier: u64) {
+    #[test]
+    fn queue_identifier_returns_supplied_zero() {
+        assert_queue_identifier(0);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queue_identifier_returns_supplied_nonzero() {
+        assert_queue_identifier(42);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queue_identifier_returns_supplied_max() {
+        assert_queue_identifier(u64::MAX);
+    }
+
+    #[cfg(not(miri))]
+    fn assert_queue_identifier(identifier: u64) {
         let size = minimum_file_size::<u64>(4);
         let file = create_temp_shmem_file().expect("temp file");
         // SAFETY: fresh file, initialized once with one producer and u64 payloads.
         let producer =
-            unsafe { Producer::<u64>::create_with_identity(&file, size, identifier) }.unwrap();
+            unsafe { Producer::<u64>::create_with_identifier(&file, size, identifier) }.unwrap();
         // SAFETY: the file contains a u64 queue with no consumer yet.
         let consumer = unsafe { Consumer::<u64>::join(&file) }.unwrap();
         assert_eq!(producer.queue_identifier(), identifier);
@@ -1449,7 +1464,7 @@ mod tests {
         let file = create_temp_shmem_file().expect("temp file");
         // SAFETY: fresh file, initialized once with one consumer and u64 payloads.
         let consumer =
-            unsafe { Consumer::<u64>::create_with_identity(&file, size, identifier) }.unwrap();
+            unsafe { Consumer::<u64>::create_with_identifier(&file, size, identifier) }.unwrap();
         // SAFETY: the file contains a u64 queue with no producer yet.
         let producer = unsafe { Producer::<u64>::join(&file) }.unwrap();
         assert_eq!(producer.queue_identifier(), identifier);

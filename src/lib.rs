@@ -10,8 +10,8 @@ pub mod mpmc;
 mod shmem;
 pub mod spsc;
 
-/// Stored queue ID when no identifier is supplied.
-pub(crate) const DEFAULT_QUEUE_ID: u64 = 0;
+/// Stored queue identifier when no identifier is supplied.
+pub(crate) const DEFAULT_QUEUE_IDENTIFIER: u64 = 0;
 
 pub(crate) const VERSION_MAJOR: u16 = 3;
 pub(crate) const VERSION_PATCH: u16 = 0;
