@@ -26,6 +26,7 @@ windows-sys = {
 [dev-dependencies]
 core_affinity = "0.8.3"
 ctrlc = "3.5.2"
+rstest = { version = "0.27.0", default-features = false }
 
 [lints.rust]
 unsafe_op_in_unsafe_fn = "deny"

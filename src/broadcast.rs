@@ -75,7 +75,7 @@ use std::time::Duration;
 use crate::error::{Error, WaitError};
 use crate::futex::{Waiters, SPIN_ATTEMPTS};
 use crate::shmem::Region;
-use crate::{CacheAlignedAtomicSize, VERSION};
+use crate::{CacheAlignedAtomicSize, DEFAULT_QUEUE_ID, VERSION};
 
 use consumer_state::{ConsumerRecoveryMode, ConsumerState};
 use producer_lane::{LaneHeader, ProducerLane};
@@ -135,14 +135,23 @@ where
     ///   value must be valid in every process that reads it. The `Copy` bound
     ///   does not make embedded pointers or references process-portable.
     pub unsafe fn create(file: &File, config: BroadcastConfig) -> Result<Self, Error> {
-        // SAFETY: caller guarantees this mapping is initialized exactly once.
-        let shared_queue = unsafe { SharedQueue::create::<T>(file, &config) }?;
+        // SAFETY: the caller upholds the same requirements as create_with_identity.
+        unsafe { Self::create_with_identity(file, config, DEFAULT_QUEUE_ID) }
+    }
 
-        Ok(Self {
-            shared_queue,
-            _message_type: PhantomData,
-            _payload_invariant: PhantomData,
-        })
+    /// Creates a broadcast queue in `file` with a caller chosen identifier.
+    /// The identifier is not enforced to be unique.
+    ///
+    /// # Safety
+    /// The same requirements as [`Self::create`] apply.
+    pub unsafe fn create_with_identity(
+        file: &File,
+        config: BroadcastConfig,
+        queue_identifier: u64,
+    ) -> Result<Self, Error> {
+        // SAFETY: caller guarantees this mapping is initialized exactly once.
+        let shared_queue = unsafe { SharedQueue::create::<T>(file, &config, queue_identifier) }?;
+        Ok(Self::from_queue(shared_queue))
     }
 
     /// Joins an existing broadcast queue in `file`.
@@ -321,6 +330,13 @@ impl<T> Broadcast<T> {
         self.shared_queue.producer_slots()
     }
 
+    /// Returns the identifier of the queue.
+    ///
+    /// Returns `0` when created without an explicit identifier.
+    pub fn queue_identifier(&self) -> u64 {
+        self.shared_queue.header().identifier
+    }
+
     /// Returns borrowed [`LaneMetadata`] for the lane at `lane_index`.
     ///
     /// Returns [`None`] if the index is out of range or no producer has
@@ -390,6 +406,7 @@ struct SharedQueueHeader {
     consumer_slots: u32,
     payload_size: usize,
     payload_align: usize,
+    identifier: u64,
     /// Count of consumers blocked waiting for any lane to publish.
     waiters: Waiters,
     /// Futex word for blocked consumers: bumped only when a publish wakes one
@@ -405,7 +422,7 @@ impl SharedQueueHeader {
     ///   [`SharedQueueHeader`].
     /// - Access to `header` must be unique.
     /// - The queue's non-header sections must already be initialized.
-    unsafe fn init(header: NonNull<Self>, layout: &QueueLayout) {
+    unsafe fn init(header: NonNull<Self>, layout: &QueueLayout, identifier: u64) {
         let value = Self {
             magic: AtomicU64::new(0),
             version: VERSION,
@@ -414,6 +431,7 @@ impl SharedQueueHeader {
             consumer_slots: layout.consumer_slots as u32,
             payload_size: layout.payload_layout.size(),
             payload_align: layout.payload_layout.align(),
+            identifier,
             waiters: Waiters::default(),
             wake_seq: CacheAlignedAtomicSize::default(),
         };
@@ -563,13 +581,14 @@ impl SharedQueue {
     unsafe fn create_in_region<T>(
         region: &Arc<Region>,
         config: &BroadcastConfig,
+        identifier: u64,
     ) -> Result<Self, Error> {
         let layout = QueueLayout::new::<T>(config)?;
         if region.size() < layout.total {
             return Err(Error::InvalidBufferSize);
         }
         // SAFETY: region is large enough and (per the contract) initialized once.
-        unsafe { Self::initialize(region, &layout) };
+        unsafe { Self::initialize(region, &layout, identifier) };
         Ok(Self::from_region(Arc::clone(region), layout))
     }
 
@@ -614,7 +633,7 @@ impl SharedQueue {
 
     /// # Safety
     /// - `region` must be at least `layout.total` bytes and initialized once.
-    unsafe fn initialize(region: &Arc<Region>, layout: &QueueLayout) {
+    unsafe fn initialize(region: &Arc<Region>, layout: &QueueLayout, identifier: u64) {
         let base = region.addr();
 
         // Global consumer-ownership table: every index free.
@@ -638,7 +657,7 @@ impl SharedQueue {
         let header = base.cast();
         // SAFETY: region is page-aligned, large enough for the header, uniquely
         // initialized here, and all non-header sections are initialized above.
-        unsafe { SharedQueueHeader::init(header, layout) };
+        unsafe { SharedQueueHeader::init(header, layout, identifier) };
     }
 
     fn from_region(region: Arc<Region>, layout: QueueLayout) -> Self {
@@ -785,12 +804,16 @@ impl SharedQueue {
     /// # Safety
     /// - `file` must be initialized as a queue at most once (by the designated
     ///   initializer) and not resized while any handle is joined.
-    unsafe fn create<T>(file: &File, config: &BroadcastConfig) -> Result<Self, Error> {
+    unsafe fn create<T>(
+        file: &File,
+        config: &BroadcastConfig,
+        identifier: u64,
+    ) -> Result<Self, Error> {
         let layout = QueueLayout::new::<T>(config)?;
         file.set_len(layout.total as u64)?;
         let region = Region::map_file(file, layout.total)?;
         // SAFETY: caller guarantees this mapping is initialized exactly once.
-        unsafe { Self::create_in_region::<T>(&region, config) }
+        unsafe { Self::create_in_region::<T>(&region, config, identifier) }
     }
 
     /// Maps and validates an existing broadcast queue in `file`.
@@ -2020,7 +2043,9 @@ mod tests {
         let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once here.
-        let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
+        let queue =
+            unsafe { SharedQueue::create_in_region::<Payload>(&region, &config, DEFAULT_QUEUE_ID) }
+                .unwrap();
         Producer::from_queue(queue, id).unwrap()
     }
 
@@ -2064,6 +2089,52 @@ mod tests {
             #[cfg(not(miri))]
             create_identified_file_backed_producer,
         ]
+    }
+
+    #[cfg(not(miri))]
+    #[rstest::rstest]
+    #[case::zero(0)]
+    #[case::nonzero(42)]
+    #[case::max(u64::MAX)]
+    fn queue_identifier_returns_supplied_id(#[case] identifier: u64) {
+        let file = create_temp_shmem_file().expect("temp file");
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        // SAFETY: fresh file, initialized once with process-portable u64 payloads.
+        let broadcast =
+            unsafe { Broadcast::<u64>::create_with_identity(&file, config, identifier) }.unwrap();
+        assert_eq!(broadcast.queue_identifier(), identifier);
+
+        // SAFETY: the file contains a live broadcast queue with u64 payloads.
+        let joined = unsafe { Broadcast::<u64>::join(&file) }.unwrap();
+        assert_eq!(joined.queue_identifier(), identifier);
+        // SAFETY: u64 has fully initialized, process-portable payload bytes.
+        let untyped = unsafe { Broadcast::join_untyped(&file) }.unwrap();
+        assert_eq!(untyped.queue_identifier(), identifier);
+    }
+
+    #[cfg(not(miri))]
+    #[test]
+    fn queue_identifier_defaults_to_zero() {
+        let file = create_temp_shmem_file().expect("temp file");
+        let config = BroadcastConfig {
+            capacity: 4,
+            producer_slots: 1,
+            consumer_slots: 1,
+        };
+        // SAFETY: fresh file, initialized once with process-portable u64 payloads.
+        let broadcast = unsafe { Broadcast::<u64>::create(&file, config) }.unwrap();
+        assert_eq!(broadcast.queue_identifier(), 0);
+
+        // SAFETY: the file contains a live broadcast queue with u64 payloads.
+        let joined = unsafe { Broadcast::<u64>::join(&file) }.unwrap();
+        assert_eq!(joined.queue_identifier(), 0);
+        // SAFETY: u64 has fully initialized, process-portable payload bytes.
+        let untyped = unsafe { Broadcast::join_untyped(&file) }.unwrap();
+        assert_eq!(untyped.queue_identifier(), 0);
     }
 
     #[test]
@@ -2217,7 +2288,9 @@ mod tests {
         let size = QueueLayout::new::<Payload>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        let queue = unsafe { SharedQueue::create_in_region::<Payload>(&region, &config) }.unwrap();
+        let queue =
+            unsafe { SharedQueue::create_in_region::<Payload>(&region, &config, DEFAULT_QUEUE_ID) }
+                .unwrap();
 
         assert_eq!(queue.header().payload_size, size_of::<Payload>());
         assert_eq!(queue.header().payload_align, align_of::<Payload>());
@@ -2233,7 +2306,8 @@ mod tests {
         let size = QueueLayout::new::<u64>(&config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        unsafe { SharedQueue::create_in_region::<u64>(&region, &config) }.unwrap();
+        unsafe { SharedQueue::create_in_region::<u64>(&region, &config, DEFAULT_QUEUE_ID) }
+            .unwrap();
 
         // Same payload size as `u64`, but different alignment.
         // SAFETY: the region is a live broadcast queue; validation should fail.
@@ -3203,7 +3277,8 @@ mod tests {
         let size = QueueLayout::new::<Payload>(config).expect("layout").total;
         let region = Region::alloc(NonZeroUsize::new(size).unwrap()).expect("alloc");
         // SAFETY: freshly allocated region, initialized exactly once.
-        unsafe { SharedQueue::create_in_region::<Payload>(&region, config) }.unwrap()
+        unsafe { SharedQueue::create_in_region::<Payload>(&region, config, DEFAULT_QUEUE_ID) }
+            .unwrap()
     }
 
     #[test]
