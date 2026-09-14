@@ -250,6 +250,11 @@ impl ProducerLane {
         unsafe { self.ring.byte_add(offset) }
     }
 
+    /// Whether the lane is still free to claim.
+    pub(crate) fn is_free(&self) -> bool {
+        self.header().state.load(Ordering::Acquire) == LANE_FREE
+    }
+
     /// Claims the lane for a producer, installing its `producer_id`. Returns
     /// `false` if already owned.
     #[must_use]
@@ -427,6 +432,7 @@ mod tests {
                 Ordering::Acquire,
             )
             .expect("lane is free");
+        assert!(!lane.is_free());
         header.producer_id.store(42, Ordering::Relaxed);
 
         let metadata = LaneMetadata::try_new(lane.header(), LaneIndex::new(0));

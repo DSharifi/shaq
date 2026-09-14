@@ -86,6 +86,13 @@ impl ConsumerState {
         self.slot_count
     }
 
+    /// Number of global consumer indices currently free to claim.
+    pub(crate) fn available_slots(&self) -> usize {
+        (0..self.slot_count)
+            .filter(|&index| self.slot(index).load(Ordering::Acquire) == CONSUMER_FREE)
+            .count()
+    }
+
     /// Claims a free consumer index in the global ownership table. The index
     /// remains in the joining phase until every lane has installed its cursor.
     pub(crate) fn acquire(&self) -> Result<usize, Error> {
@@ -337,8 +344,11 @@ mod tests {
         let (_region, state) = consumer_state(2);
 
         assert_eq!(state.len(), 2);
+        assert_eq!(state.available_slots(), 2);
         assert_eq!(state.acquire().unwrap(), 0);
+        assert_eq!(state.available_slots(), 1);
         assert_eq!(state.acquire().unwrap(), 1);
+        assert_eq!(state.available_slots(), 0);
         assert!(matches!(
             state.acquire(),
             Err(Error::ConsumerSlotsExhausted)
@@ -355,6 +365,7 @@ mod tests {
         ));
 
         state.release(0);
+        assert_eq!(state.available_slots(), 1);
         assert_eq!(state.acquire().unwrap(), 0);
 
         state.release(1);

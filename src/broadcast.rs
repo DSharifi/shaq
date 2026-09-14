@@ -330,6 +330,25 @@ impl<T> Broadcast<T> {
         self.shared_queue.producer_slots()
     }
 
+    /// Number of producer slots available to claim.
+    ///
+    /// Claimed lanes never return to the free pool, including after their
+    /// producer drops.
+    pub fn available_producer_slots(&self) -> usize {
+        self.shared_queue
+            .producer_lanes()
+            .filter(ProducerLane::is_free)
+            .count()
+    }
+
+    /// Number of consumer slots available to claim.
+    ///
+    /// Consumer slots return to the free pool when their handles drop or are
+    /// force-released
+    pub fn available_consumer_slots(&self) -> usize {
+        self.shared_queue.consumer_state.available_slots()
+    }
+
     /// Returns the identifier of the queue.
     ///
     /// Returns `0` when created without an explicit identifier.
@@ -1997,6 +2016,8 @@ impl Drop for SliceReadBatch<'_> {
 
 #[cfg(test)]
 mod tests {
+    use std::assert_matches;
+
     use super::*;
     #[cfg(not(miri))]
     use crate::shmem::create_temp_shmem_file;
@@ -2841,6 +2862,67 @@ mod tests {
             let producer_slots = producer.broadcast_handle().producer_slots();
 
             assert_eq!(producer_slots, 2);
+        }
+    }
+
+    #[test]
+    fn available_slots_track_endpoint_lifetimes() {
+        for create in producer_creators() {
+            let producer: Producer<u64> = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 2,
+                consumer_slots: 2,
+            });
+            let broadcast: Broadcast<u64> = producer.broadcast_handle();
+            assert_eq!(broadcast.available_producer_slots(), 1);
+            assert_eq!(broadcast.available_consumer_slots(), 2);
+
+            let other_producer = broadcast.producer(BOGUS_ID).unwrap();
+            let consumer = broadcast.consumer().unwrap();
+            // SAFETY: `Payload` is `u64`, whose entire representation is initialized.
+            let slice_consumer =
+                unsafe { broadcast.slice_consumer() }.expect("one consumer slot is available");
+            let untyped = slice_consumer.broadcast_handle();
+            assert_eq!(untyped.available_producer_slots(), 0);
+            assert_eq!(untyped.available_consumer_slots(), 0);
+
+            drop(producer);
+            drop(other_producer);
+            assert_eq!(
+                broadcast.available_producer_slots(),
+                0,
+                "dropping producers retires them, producer slots should not increase on producer drop."
+            );
+            assert_matches!(
+                broadcast.producer(BOGUS_ID),
+                Err(Error::ProducerSlotsExhausted)
+            );
+
+            drop(consumer);
+            assert_eq!(
+                untyped.available_consumer_slots(),
+                1,
+                "dropping a consumer must increase the consumer availability"
+            );
+
+            drop(slice_consumer);
+            assert_eq!(
+                broadcast.available_consumer_slots(),
+                2,
+                "dropping a slice consumer must increase the consumer availability"
+            );
+        }
+    }
+
+    #[test]
+    fn available_consumer_slots_is_zero_without_consumers() {
+        for create in producer_creators() {
+            let producer = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 0,
+            });
+            assert_eq!(producer.broadcast_handle().available_consumer_slots(), 0);
         }
     }
 
