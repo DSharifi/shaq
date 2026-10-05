@@ -25,20 +25,22 @@
 //! resumes where the dead owner was; an interrupted join restarts at each
 //! lane's current reservation frontier.
 //!
-//! Producer lanes bind to at most one producer for the queue's lifetime: a lane
-//! is claimed on join and permanently retired when its producer drops; a
-//! crashed producer's lane stays claimed. Neither returns to the free pool, so
-//! per-lane state always describes a single producer. Replacing producers
-//! means recreating the queue.
+//! Dropping a producer releases its lane for reuse. A replacement continues
+//! from the lane's publication frontier, preserving unread values and consumer
+//! progress. A crashed producer's lane stays claimed; replacing it requires
+//! recreating the queue. A lane with an unpublished reservation (from a
+//! forgotten write guard) also stays claimed.
 //!
-//! Each lane carries metadata: a caller-supplied [`ProducerId`] and a counter
-//! of items rejected by backpressure. The producer ID is permanently associated
-//! with its lane, including after the producer is dropped. Shaq treats IDs as
-//! opaque values and does not enforce uniqueness; callers requiring distinct
-//! producer attribution must provide unique IDs on producer creation.
+//! Each lane carries metadata: the caller-supplied [`ProducerId`] of its current
+//! or most recent owner, and a counter of items rejected by backpressure over
+//! the lane's lifetime. Shaq treats IDs as opaque values and does not enforce
+//! uniqueness; callers requiring distinct producer attribution must provide
+//! unique IDs on producer creation.
 //!
 //! A read guard exposes the publishing lane's metadata via
-//! [`ReadGuard::lane_metadata`]. To poll metadata by lane index, borrow
+//! [`ReadGuard::lane_metadata`]. Its [`LaneMetadata::producer_id`] is the id of
+//! the producer that published the value, or `None` if the lane has since been
+//! handed to another producer. To poll metadata by lane index, borrow
 //! [`LaneMetadata`] with [`Broadcast::lane_metadata`].
 //!
 //! Typed payloads require `T: Copy`, which ensures that `T` cannot implement
@@ -341,7 +343,8 @@ impl<T> Broadcast<T> {
     ///
     /// Returns [`None`] if the index is out of range or no producer has
     /// completed acquisition of the lane. Once acquired, a lane retains its
-    /// metadata after retirement.
+    /// metadata after release; its [`LaneMetadata::producer_id`] reports the
+    /// current or most recent owner.
     pub fn lane_metadata(&self, lane_index: usize) -> Option<LaneMetadata<'_>> {
         self.shared_queue.lane_metadata(lane_index)
     }
@@ -1016,7 +1019,7 @@ impl<T: Copy> Producer<T> {
 
 impl<T: Copy> Drop for Producer<T> {
     fn drop(&mut self) {
-        self.lane.retire();
+        self.lane.release();
     }
 }
 
@@ -1252,9 +1255,12 @@ impl ConsumerCore {
         self.queue.payload.size()
     }
 
-    /// Returns metadata for a lane containing a published value.
+    /// Returns metadata for the value(s) a live guard or batch holds on `lane`.
+    /// The guard pins this consumer's cursor at its first sequence until it is
+    /// dropped.
     fn lane_metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
-        self.lane(lane.get()).metadata(lane)
+        let sequence = self.next_for_lane(lane.get());
+        self.lane(lane.get()).message_metadata(lane, sequence)
     }
 
     #[inline]
@@ -2169,7 +2175,9 @@ mod tests {
                 Err(Error::ProducerSlotsExhausted)
             ));
             drop(p1);
-            // The dropped lane is retired, not returned to the pool.
+            // Dropping a producer returns its lane to the pool.
+            let replacement = broadcast.producer(BOGUS_ID).unwrap();
+            assert_eq!(replacement.index(), 1);
             assert!(matches!(
                 broadcast.producer(BOGUS_ID),
                 Err(Error::ProducerSlotsExhausted)
@@ -2881,7 +2889,7 @@ mod tests {
                 .lane_metadata(producer.index())
                 .expect("owned lane has metadata");
 
-            assert_eq!(producer_id, metadata.producer_id());
+            assert_eq!(Some(producer_id), metadata.producer_id());
         }
     }
 
@@ -3014,7 +3022,7 @@ mod tests {
             let source_producer_id = guard.lane_metadata().producer_id();
             drop(guard);
 
-            assert_eq!(source_producer_id, publishing_producer.producer_id());
+            assert_eq!(source_producer_id, Some(publishing_producer.producer_id()));
         }
     }
 
@@ -3073,12 +3081,12 @@ mod tests {
 
             drop(producer);
 
-            assert_eq!(metadata.producer_id(), producer_id);
+            assert_eq!(metadata.producer_id(), Some(producer_id));
         }
     }
 
     #[test]
-    fn retired_lane_metadata_keeps_the_rejected_items_count() {
+    fn released_lane_metadata_keeps_the_rejected_items_count() {
         for create in producer_creators() {
             let mut producer = create(BroadcastConfig {
                 capacity: 4,
@@ -3097,7 +3105,7 @@ mod tests {
 
             let metadata = broadcast
                 .lane_metadata(lane)
-                .expect("retired lane retains metadata");
+                .expect("released lane retains metadata");
             assert_eq!(metadata.rejected_items(), 1);
         }
     }
@@ -3124,7 +3132,10 @@ mod tests {
             let guard = consumer.try_reserve_read().expect("readable");
             drop(guard);
 
-            assert_eq!(metadata.producer_id(), publishing_producer.producer_id());
+            assert_eq!(
+                metadata.producer_id(),
+                Some(publishing_producer.producer_id())
+            );
         }
     }
 
@@ -3176,7 +3187,7 @@ mod tests {
             let source_producer_id = batch.lane_metadata().producer_id();
             drop(batch);
 
-            assert_eq!(source_producer_id, publishing_producer.producer_id());
+            assert_eq!(source_producer_id, Some(publishing_producer.producer_id()));
         }
     }
 
@@ -3238,7 +3249,7 @@ mod tests {
         let source_producer_id = guard.lane_metadata().producer_id();
         drop(guard);
 
-        assert_eq!(source_producer_id, producer.producer_id());
+        assert_eq!(source_producer_id, Some(producer.producer_id()));
     }
 
     #[test]
@@ -3284,7 +3295,227 @@ mod tests {
         let source_producer_id = batch.lane_metadata().producer_id();
         drop(batch);
 
-        assert_eq!(source_producer_id, producer.producer_id());
+        assert_eq!(source_producer_id, Some(producer.producer_id()));
+    }
+
+    #[test]
+    fn read_guard_producer_id_is_none_after_the_lane_changes_owner() {
+        for create in identified_producer_creators() {
+            let first_id = ProducerId::new(41);
+            let mut first = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                first_id,
+            );
+            let broadcast = first.broadcast_handle();
+            let mut consumer = broadcast.consumer().unwrap();
+            first.try_write(7).expect("ring has capacity");
+            let guard = consumer.try_reserve_read().expect("readable");
+            assert_eq!(guard.lane_metadata().producer_id(), Some(first_id));
+
+            drop(first);
+            let _second = broadcast.producer(ProducerId::new(42)).unwrap();
+
+            assert_eq!(guard.lane_metadata().producer_id(), None);
+            assert_eq!(guard.read(), 7);
+        }
+    }
+
+    #[test]
+    fn values_from_a_previous_owner_have_no_producer_id() {
+        for create in identified_producer_creators() {
+            let mut first = create(
+                BroadcastConfig {
+                    capacity: 8,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = first.broadcast_handle();
+            let mut consumer = broadcast.consumer().unwrap();
+            assert!(first.try_write_slice(&[1, 2]));
+            drop(first);
+            let second_id = ProducerId::new(42);
+            let mut second = broadcast.producer(second_id).unwrap();
+            assert!(second.try_write_slice(&[3, 4]));
+
+            let guard = consumer.try_reserve_read().expect("readable");
+            assert_eq!(guard.lane_metadata().producer_id(), None);
+            assert_eq!(guard.read(), 1);
+            // A batch that starts in an earlier tenure has no single owner.
+            let batch = consumer
+                .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
+                .expect("readable batch");
+            assert_eq!(batch.as_slices(), (&[2, 3, 4][..], &[][..]));
+            assert_eq!(batch.lane_metadata().producer_id(), None);
+            drop(batch);
+            second.try_write(5).expect("ring has capacity");
+            let guard = consumer.try_reserve_read().expect("readable");
+            assert_eq!(guard.lane_metadata().producer_id(), Some(second_id));
+            assert_eq!(guard.read(), 5);
+        }
+    }
+
+    #[test]
+    fn lane_metadata_reports_the_current_owner_after_reuse() {
+        for create in identified_producer_creators() {
+            let first = create(
+                BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                },
+                ProducerId::new(41),
+            );
+            let broadcast = first.broadcast_handle();
+            let metadata = broadcast.lane_metadata(first.index()).unwrap();
+            drop(first);
+
+            let second_id = ProducerId::new(42);
+            let _second = broadcast.producer(second_id).unwrap();
+
+            assert_eq!(metadata.producer_id(), Some(second_id));
+        }
+    }
+
+    #[test]
+    fn lane_reuse_preserves_backpressure_and_rejection_count() {
+        for create in producer_creators() {
+            let mut producer = create(BroadcastConfig {
+                capacity: 2,
+                producer_slots: 1,
+                consumer_slots: 2,
+            });
+            let broadcast = producer.broadcast_handle();
+            let metadata = broadcast.lane_metadata(producer.index()).unwrap();
+            let mut consumer = broadcast.consumer().unwrap();
+            let mut slow_consumer = broadcast.consumer().unwrap();
+            producer.try_write(1).unwrap();
+            producer.try_write(2).unwrap();
+            assert_eq!(producer.try_write(3), Err(3));
+            let guard = consumer.try_reserve_read().unwrap();
+            drop(producer);
+
+            let mut replacement = broadcast.producer(BOGUS_ID).unwrap();
+            assert_eq!(metadata.rejected_items(), 1);
+            assert_eq!(replacement.try_write(3), Err(3));
+            assert_eq!(guard.read(), 1);
+            assert_eq!(replacement.try_write(3), Err(3));
+            assert_eq!(slow_consumer.try_read(), Some(1));
+            replacement.try_write(3).unwrap();
+            assert_eq!(metadata.rejected_items(), 3);
+            assert_eq!(consumer.try_read(), Some(2));
+            assert_eq!(consumer.try_read(), Some(3));
+            assert_eq!(consumer.try_read(), None);
+            assert_eq!(slow_consumer.try_read(), Some(2));
+            assert_eq!(slow_consumer.try_read(), Some(3));
+            assert_eq!(slow_consumer.try_read(), None);
+        }
+    }
+
+    #[test]
+    fn dropped_producer_with_unpublished_reservation_stays_claimed() {
+        for create in producer_creators() {
+            for batch in [false, true] {
+                let mut producer = create(BroadcastConfig {
+                    capacity: 4,
+                    producer_slots: 1,
+                    consumer_slots: 1,
+                });
+                let broadcast = producer.broadcast_handle();
+                let mut consumer = broadcast.consumer().unwrap();
+                producer.try_write(1).unwrap();
+                if batch {
+                    // SAFETY: the uninitialized reservation is forgotten, never published.
+                    let guard =
+                        unsafe { producer.try_reserve_write_batch(NonZeroUsize::new(2).unwrap()) }
+                            .unwrap();
+                    std::mem::forget(guard);
+                } else {
+                    // SAFETY: the uninitialized reservation is forgotten, never published.
+                    let guard = unsafe { producer.try_reserve_write() }.unwrap();
+                    std::mem::forget(guard);
+                }
+                drop(producer);
+
+                assert!(matches!(
+                    broadcast.producer(BOGUS_ID),
+                    Err(Error::ProducerSlotsExhausted)
+                ));
+                assert_eq!(consumer.try_read(), Some(1));
+                assert_eq!(consumer.try_read(), None);
+            }
+        }
+    }
+
+    #[test]
+    fn producer_id_is_never_misattributed_across_lane_reuse() {
+        use std::thread;
+
+        const PRODUCER_THREADS: u64 = 2;
+        const TENURES_PER_THREAD: u64 = 500;
+        const ITEMS_PER_TENURE: u64 = 3;
+        const TOTAL_ITEMS: u64 = PRODUCER_THREADS * TENURES_PER_THREAD * ITEMS_PER_TENURE;
+
+        for create in producer_creators() {
+            let initial = create(BroadcastConfig {
+                capacity: 4,
+                producer_slots: 1,
+                consumer_slots: 1,
+            });
+            let broadcast = initial.broadcast_handle();
+            let mut consumer = broadcast.consumer().unwrap();
+            drop(initial);
+
+            // Every tenure gets a unique id and writes it as the payload, so any
+            // id a reader is given can be checked against the values.
+            let producer_threads: Vec<_> = (0..PRODUCER_THREADS)
+                .map(|thread_index| {
+                    let broadcast = broadcast.clone();
+                    thread::spawn(move || {
+                        for tenure in 0..TENURES_PER_THREAD {
+                            let id = thread_index * TENURES_PER_THREAD + tenure;
+                            let mut producer = loop {
+                                match broadcast.producer(ProducerId::new(id)) {
+                                    Ok(producer) => break producer,
+                                    Err(Error::ProducerSlotsExhausted) => thread::yield_now(),
+                                    Err(err) => panic!("unexpected error: {err:?}"),
+                                }
+                            };
+                            for _ in 0..ITEMS_PER_TENURE {
+                                while producer.try_write(id).is_err() {
+                                    thread::yield_now();
+                                }
+                            }
+                        }
+                    })
+                })
+                .collect();
+
+            let mut read = 0;
+            while read < TOTAL_ITEMS {
+                let batch = consumer
+                    .reserve_read_batch_timeout(
+                        NonZeroUsize::new(2).unwrap(),
+                        Duration::from_secs(5),
+                    )
+                    .expect("published value");
+                if let Some(producer_id) = batch.lane_metadata().producer_id() {
+                    let (first, second) = batch.as_slices();
+                    for &value in first.iter().chain(second) {
+                        assert_eq!(value, producer_id.get());
+                    }
+                }
+                read += batch.len() as u64;
+            }
+            for producer_thread in producer_threads {
+                producer_thread.join().expect("producer thread");
+            }
+        }
     }
 
     /// Allocates a heap-backed queue and returns the shared handle (recovery
@@ -3309,22 +3540,21 @@ mod tests {
         let queue = recovery_queue(&config);
         let mut consumer = Consumer::from_queue(queue.clone()).unwrap();
 
-        // A producer publishes two items and drops, retiring its lane.
+        // A producer publishes two items and drops, releasing its lane.
         {
             let mut producer = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
             assert!(producer.try_write(1).is_ok());
             assert!(producer.try_write(2).is_ok());
         }
 
-        // The retired lane is never handed to a new producer.
-        assert!(matches!(
-            Producer::<Payload>::from_queue(queue.clone(), BOGUS_ID),
-            Err(Error::ProducerSlotsExhausted)
-        ));
+        // A replacement continues after the previous publications.
+        let mut replacement = Producer::from_queue(queue.clone(), BOGUS_ID).unwrap();
+        assert!(replacement.try_write(3).is_ok());
 
-        // The consumer still drains what the dead producer published.
+        // The consumer drains both producers' publications in order.
         assert_eq!(consumer.try_read(), Some(1));
         assert_eq!(consumer.try_read(), Some(2));
+        assert_eq!(consumer.try_read(), Some(3));
         assert_eq!(consumer.try_read(), None);
     }
 

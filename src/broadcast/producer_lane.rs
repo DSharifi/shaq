@@ -6,7 +6,7 @@ use core::alloc::Layout;
 use core::mem::{align_of, size_of};
 use core::num::NonZeroUsize;
 use core::ptr::NonNull;
-use core::sync::atomic::{fence, AtomicU64, Ordering};
+use core::sync::atomic::{fence, AtomicU64, AtomicUsize, Ordering};
 use std::marker::PhantomData;
 
 use crate::broadcast::{InitializedLane, LaneIndex, ProducerId, UnverifiedLane};
@@ -17,16 +17,20 @@ use super::consumer_state::LaneConsumerState;
 const LANE_FREE: u64 = 0;
 const LANE_CLAIMING: u64 = 1;
 const LANE_ACTIVE: u64 = 2;
-const LANE_RETIRED: u64 = 3;
+const LANE_RELEASED: u64 = 3;
 
 /// Fixed-size head of a producer-lane block.
 #[repr(C)]
 pub(super) struct LaneHeader {
-    /// Lane ownership: `LANE_FREE`, `LANE_CLAIMING`, `LANE_ACTIVE`, or `LANE_RETIRED`.
+    /// Lane ownership: `LANE_FREE`, `LANE_CLAIMING`, `LANE_ACTIVE`, or `LANE_RELEASED`.
     state: AtomicU64,
-    /// Supplied [`ProducerId`], meaningful once the lane is active or retired.
+    /// [`ProducerId`] of the current or most recent owner, meaningful once the
+    /// lane is active or released.
     producer_id: AtomicU64,
-    /// Count of messages refused by backpressure.
+    /// First sequence of the current or most recent owner's tenure. Sequences
+    /// below it were published by an earlier owner whose id is no longer stored.
+    tenure_start: AtomicUsize,
+    /// Count of messages refused by backpressure over the lane's lifetime.
     rejected_items: AtomicU64,
     /// Claimed-up-to sequence: advanced before a ring cell is written.
     producer_reservation: CacheAlignedAtomicSize,
@@ -61,6 +65,9 @@ pub(crate) struct ProducerLane {
 pub struct LaneMetadata<'a> {
     header: &'a LaneHeader,
     lane: LaneIndex<InitializedLane>,
+    /// First sequence of the message(s) this view describes, or `None` for a
+    /// lane-level view.
+    sequence: Option<usize>,
 }
 
 impl<'a> LaneMetadata<'a> {
@@ -68,7 +75,7 @@ impl<'a> LaneMetadata<'a> {
     pub(super) fn try_new(header: &'a LaneHeader, lane: LaneIndex<UnverifiedLane>) -> Option<Self> {
         let state = header.state.load(Ordering::Acquire);
 
-        let lane_is_acquired = matches!(state, LANE_ACTIVE | LANE_RETIRED);
+        let lane_is_acquired = matches!(state, LANE_ACTIVE | LANE_RELEASED);
         if !lane_is_acquired {
             return None;
         }
@@ -79,15 +86,22 @@ impl<'a> LaneMetadata<'a> {
                 index: lane.get(),
                 _state: PhantomData,
             },
+            sequence: None,
         })
     }
 
-    /// Builds a metadata view over a borrowed lane header.
-    pub(super) fn from_initialized_lane(
+    /// Builds a metadata view for the published message(s) starting at
+    /// `sequence`.
+    pub(super) fn for_message(
         header: &'a LaneHeader,
         lane: LaneIndex<InitializedLane>,
+        sequence: usize,
     ) -> Self {
-        Self { header, lane }
+        Self {
+            header,
+            lane,
+            sequence: Some(sequence),
+        }
     }
 
     /// The index of this producer lane.
@@ -96,13 +110,26 @@ impl<'a> LaneMetadata<'a> {
         self.lane.get()
     }
 
-    /// The producer chosen [`ProducerId`] permanently associated with this lane.
+    /// The producer chosen [`ProducerId`] for this view.
+    ///
+    /// For a view borrowed from a read guard or batch, this is the id of the
+    /// producer that published the value(s), or `None` if the lane has since
+    /// been handed to another producer and that id is no longer stored. For a
+    /// lane-level view, this is the lane's current or most recent owner.
     #[inline]
-    pub fn producer_id(&self) -> ProducerId {
-        ProducerId::new(self.header.producer_id.load(Ordering::Relaxed))
+    pub fn producer_id(&self) -> Option<ProducerId> {
+        // Pairs with the release store in `ProducerLane::try_acquire`: observing
+        // a tenure's id also observes that tenure's start or a later one, so a
+        // value is never attributed to a producer that took over after it.
+        let producer_id = ProducerId::new(self.header.producer_id.load(Ordering::Acquire));
+        let Some(sequence) = self.sequence else {
+            return Some(producer_id);
+        };
+        let tenure_start = self.header.tenure_start.load(Ordering::Relaxed);
+        (sequence >= tenure_start).then_some(producer_id)
     }
 
-    /// Count of messages refused by backpressure on this lane.
+    /// Count of messages refused by backpressure over this lane's lifetime.
     #[inline]
     pub fn rejected_items(&self) -> u64 {
         self.header.rejected_items.load(Ordering::Relaxed)
@@ -163,6 +190,7 @@ impl ProducerLane {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
             producer_id: AtomicU64::new(0),
+            tenure_start: AtomicUsize::new(0),
             rejected_items: AtomicU64::new(0),
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
@@ -213,10 +241,15 @@ impl ProducerLane {
         }
     }
 
-    /// Returns borrowed metadata for this lane.
+    /// Returns borrowed metadata for the published message(s) starting at
+    /// `sequence` on this lane.
     #[inline]
-    pub(crate) fn metadata(&self, lane: LaneIndex<InitializedLane>) -> LaneMetadata<'_> {
-        LaneMetadata::from_initialized_lane(self.header(), lane)
+    pub(crate) fn message_metadata(
+        &self,
+        lane: LaneIndex<InitializedLane>,
+        sequence: usize,
+    ) -> LaneMetadata<'_> {
+        LaneMetadata::for_message(self.header(), lane, sequence)
     }
 
     #[inline]
@@ -250,36 +283,48 @@ impl ProducerLane {
         unsafe { self.ring.byte_add(offset) }
     }
 
-    /// Claims the lane for a producer, installing its `producer_id`. Returns
-    /// `false` if already owned.
+    /// Claims a free or released lane for a producer, starting a new tenure
+    /// that carries `producer_id`. Returns `false` if already owned.
     #[must_use]
     pub(crate) fn try_acquire(&self, producer_id: ProducerId) -> bool {
-        let acquire_result = self.header().state.compare_exchange(
-            LANE_FREE,
-            LANE_CLAIMING,
-            Ordering::AcqRel,
-            Ordering::Acquire,
-        );
+        let acquire_result =
+            self.header()
+                .state
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |state| {
+                    matches!(state, LANE_FREE | LANE_RELEASED).then_some(LANE_CLAIMING)
+                });
 
         if acquire_result.is_err() {
             return false;
         }
 
+        // A lane is only released with no unpublished reservation, so this
+        // tenure's first value lands at the reservation frontier.
+        self.header()
+            .tenure_start
+            .store(self.reserved(), Ordering::Relaxed);
+        // Store the id after the tenure start; see `LaneMetadata::producer_id`.
         self.header()
             .producer_id
-            .store(producer_id.get(), Ordering::Relaxed);
+            .store(producer_id.get(), Ordering::Release);
 
         self.header().state.store(LANE_ACTIVE, Ordering::Release);
 
         true
     }
 
-    /// Permanently retires the lane. A retired lane never returns to the free
-    /// pool, so a lane binds to at most one producer for the queue's lifetime.
-    pub(crate) fn retire(&self) {
+    /// Releases the lane for reuse, preserving its cursors, rejection count,
+    /// and the last owner's id.
+    pub(crate) fn release(&self) {
+        // A forgotten write guard can leave uninitialized cells reserved. Reuse
+        // would publish that gap, while rewinding the reservation cursor would
+        // break the concurrent consumer-join handshake. Keep this lane claimed.
+        if self.reserved() != self.published() {
+            return;
+        }
         let _ = self.header().state.compare_exchange(
             LANE_ACTIVE,
-            LANE_RETIRED,
+            LANE_RELEASED,
             Ordering::AcqRel,
             Ordering::Acquire,
         );
@@ -375,7 +420,16 @@ mod tests {
     }
 
     fn metadata(lane: &ProducerLane) -> LaneMetadata<'_> {
-        LaneMetadata::try_new(lane.header(), LaneIndex::new(0)).expect("lane is active or retired")
+        LaneMetadata::try_new(lane.header(), LaneIndex::new(0)).expect("lane is active or released")
+    }
+
+    /// The producer id reported for the published message at `sequence`.
+    fn message_producer_id(lane: &ProducerLane, sequence: usize) -> Option<ProducerId> {
+        let lane_index = LaneIndex {
+            index: 0,
+            _state: PhantomData,
+        };
+        lane.message_metadata(lane_index, sequence).producer_id()
     }
 
     /// Reserves, writes, and publishes one value; `false` on backpressure.
@@ -398,11 +452,62 @@ mod tests {
     }
 
     #[test]
-    fn retired_lane_is_never_reclaimed() {
+    fn released_lane_can_be_reclaimed() {
         let (_region, lane) = lane(4, 1);
         assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
-        lane.retire();
+        lane.release();
+        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
         assert!(!lane.try_acquire(BOGUS_PRODUCER_ID));
+    }
+
+    #[test]
+    fn reacquiring_starts_a_tenure_at_the_reservation_frontier() {
+        let (_region, mut lane) = lane(4, 1);
+        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+        for value in 0..3u64 {
+            assert!(publish_value(&mut lane, value));
+        }
+        lane.release();
+
+        assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
+
+        assert_eq!(lane.header().tenure_start.load(Ordering::Relaxed), 3);
+    }
+
+    #[test]
+    fn message_metadata_reports_only_the_publishing_tenure() {
+        let (_region, mut lane) = lane(8, 1);
+        let first = ProducerId::new(41);
+        let second = ProducerId::new(42);
+        assert!(lane.try_acquire(first));
+        assert!(publish_value(&mut lane, 0));
+        assert!(publish_value(&mut lane, 1));
+        assert_eq!(message_producer_id(&lane, 1), Some(first));
+        lane.release();
+
+        assert!(lane.try_acquire(second));
+        assert!(publish_value(&mut lane, 2));
+
+        assert_eq!(message_producer_id(&lane, 0), None);
+        assert_eq!(message_producer_id(&lane, 1), None);
+        assert_eq!(message_producer_id(&lane, 2), Some(second));
+    }
+
+    #[test]
+    fn empty_tenure_does_not_claim_earlier_messages() {
+        let (_region, mut lane) = lane(8, 1);
+        let last = ProducerId::new(43);
+        assert!(lane.try_acquire(ProducerId::new(41)));
+        assert!(publish_value(&mut lane, 0));
+        lane.release();
+        assert!(lane.try_acquire(ProducerId::new(42)));
+        lane.release();
+
+        assert!(lane.try_acquire(last));
+        assert!(publish_value(&mut lane, 1));
+
+        assert_eq!(message_producer_id(&lane, 0), None);
+        assert_eq!(message_producer_id(&lane, 1), Some(last));
     }
 
     #[test]
@@ -441,7 +546,7 @@ mod tests {
 
         let _ = lane.try_acquire(producer_id);
 
-        assert_eq!(metadata(&lane).producer_id(), producer_id);
+        assert_eq!(metadata(&lane).producer_id(), Some(producer_id));
     }
 
     #[test]
@@ -460,18 +565,18 @@ mod tests {
     }
 
     #[test]
-    fn retired_lane_keeps_the_last_owner_id() {
+    fn released_lane_keeps_the_last_owner_id() {
         let (_region, lane) = lane(4, 1);
         let producer_id = ProducerId::new(42);
         let _ = lane.try_acquire(producer_id);
 
-        lane.retire();
+        lane.release();
 
-        assert_eq!(metadata(&lane).producer_id(), producer_id);
+        assert_eq!(metadata(&lane).producer_id(), Some(producer_id));
     }
 
     #[test]
-    fn retired_lane_keeps_the_rejected_items_count() {
+    fn released_lane_keeps_the_rejected_items_count() {
         let (_region, mut lane) = lane(4, 1);
         let _ = lane.try_acquire(ProducerId::new(42));
         let _ = join_consumer(&lane, 0);
@@ -480,7 +585,7 @@ mod tests {
         }
         let _ = publish_value(&mut lane, 99);
 
-        lane.retire();
+        lane.release();
 
         assert_eq!(metadata(&lane).rejected_items(), 1);
     }
