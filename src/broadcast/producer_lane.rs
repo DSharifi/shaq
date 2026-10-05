@@ -27,9 +27,9 @@ pub(super) struct LaneHeader {
     /// [`ProducerId`] of the current or most recent owner, meaningful once the
     /// lane is active or released.
     producer_id: AtomicU64,
-    /// First sequence of the current or most recent owner's tenure. Sequences
-    /// below it were published by an earlier owner whose id is no longer stored.
-    tenure_start: AtomicUsize,
+    /// First sequence of the current or most recent producer. Sequences below
+    /// it were published by an earlier producer whose id is no longer stored.
+    producer_start_sequence: AtomicUsize,
     /// Count of messages refused by backpressure over the lane's lifetime. On
     /// its own cache line: the producer bumps it on every refused reserve, which
     /// would otherwise evict the ownership fields consumers read.
@@ -136,14 +136,14 @@ impl<'a> LaneMetadata<'a> {
     #[inline]
     pub fn producer_id(&self) -> Option<ProducerId> {
         // Pairs with the release store in `ProducerLane::try_acquire`: observing
-        // a tenure's id also observes that tenure's start or a later one, so a
+        // a producer's id also observes its start sequence or a later one, so a
         // value is never attributed to a producer that took over after it.
         let producer_id = ProducerId::new(self.header.producer_id.load(Ordering::Acquire));
         let Some(sequence) = self.sequence else {
             return Some(producer_id);
         };
-        let tenure_start = self.header.tenure_start.load(Ordering::Relaxed);
-        (sequence >= tenure_start).then_some(producer_id)
+        let producer_start_sequence = self.header.producer_start_sequence.load(Ordering::Relaxed);
+        (sequence >= producer_start_sequence).then_some(producer_id)
     }
 
     /// Count of messages refused by backpressure over this lane's lifetime.
@@ -207,7 +207,7 @@ impl ProducerLane {
         let header = LaneHeader {
             state: AtomicU64::new(LANE_FREE),
             producer_id: AtomicU64::new(0),
-            tenure_start: AtomicUsize::new(0),
+            producer_start_sequence: AtomicUsize::new(0),
             rejected_items: CacheAlignedAtomicU64::default(),
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
@@ -300,8 +300,8 @@ impl ProducerLane {
         unsafe { self.ring.byte_add(offset) }
     }
 
-    /// Claims a free or released lane for a producer, starting a new tenure
-    /// that carries `producer_id`. Returns `false` if already owned.
+    /// Claims a free or released lane for a producer, recording `producer_id`
+    /// and the sequence it starts at. Returns `false` if already owned.
     #[must_use]
     pub(crate) fn try_acquire(&self, producer_id: ProducerId) -> bool {
         let acquire_result =
@@ -316,11 +316,11 @@ impl ProducerLane {
         }
 
         // A lane is only released with no unpublished reservation, so this
-        // tenure's first value lands at the reservation frontier.
+        // producer's first value lands at the reservation frontier.
         self.header()
-            .tenure_start
+            .producer_start_sequence
             .store(self.reserved(), Ordering::Relaxed);
-        // Store the id after the tenure start; see `LaneMetadata::producer_id`.
+        // Store the id after the start sequence; see `LaneMetadata::producer_id`.
         self.header()
             .producer_id
             .store(producer_id.get(), Ordering::Release);
@@ -478,7 +478,7 @@ mod tests {
     }
 
     #[test]
-    fn reacquiring_starts_a_tenure_at_the_reservation_frontier() {
+    fn reacquiring_starts_at_the_reservation_frontier() {
         let (_region, mut lane) = lane(4, 1);
         assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
         for value in 0..3u64 {
@@ -488,11 +488,16 @@ mod tests {
 
         assert!(lane.try_acquire(BOGUS_PRODUCER_ID));
 
-        assert_eq!(lane.header().tenure_start.load(Ordering::Relaxed), 3);
+        assert_eq!(
+            lane.header()
+                .producer_start_sequence
+                .load(Ordering::Relaxed),
+            3
+        );
     }
 
     #[test]
-    fn message_metadata_reports_only_the_publishing_tenure() {
+    fn message_metadata_reports_only_the_publishing_producer() {
         let (_region, mut lane) = lane(8, 1);
         let first = ProducerId::new(41);
         let second = ProducerId::new(42);
@@ -511,7 +516,7 @@ mod tests {
     }
 
     #[test]
-    fn empty_tenure_does_not_claim_earlier_messages() {
+    fn producer_without_writes_does_not_claim_earlier_messages() {
         let (_region, mut lane) = lane(8, 1);
         let last = ProducerId::new(43);
         assert!(lane.try_acquire(ProducerId::new(41)));

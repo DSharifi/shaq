@@ -3346,7 +3346,7 @@ mod tests {
             let guard = consumer.try_reserve_read().expect("readable");
             assert_eq!(guard.lane_metadata().producer_id(), None);
             assert_eq!(guard.read(), 1);
-            // A batch that starts in an earlier tenure has no single owner.
+            // A batch that starts before the current producer has no single owner.
             let batch = consumer
                 .try_reserve_read_batch(NonZeroUsize::new(3).unwrap())
                 .expect("readable batch");
@@ -3457,9 +3457,9 @@ mod tests {
         use std::thread;
 
         const PRODUCER_THREADS: u64 = 2;
-        const TENURES_PER_THREAD: u64 = 500;
-        const ITEMS_PER_TENURE: u64 = 3;
-        const TOTAL_ITEMS: u64 = PRODUCER_THREADS * TENURES_PER_THREAD * ITEMS_PER_TENURE;
+        const PRODUCERS_PER_THREAD: u64 = 500;
+        const ITEMS_PER_PRODUCER: u64 = 3;
+        const TOTAL_ITEMS: u64 = PRODUCER_THREADS * PRODUCERS_PER_THREAD * ITEMS_PER_PRODUCER;
 
         for create in producer_creators() {
             let initial = create(BroadcastConfig {
@@ -3471,14 +3471,14 @@ mod tests {
             let mut consumer = broadcast.consumer().unwrap();
             drop(initial);
 
-            // Every tenure gets a unique id and writes it as the payload, so any
+            // Every producer gets a unique id and writes it as the payload, so any
             // id a reader is given can be checked against the values.
             let producer_threads: Vec<_> = (0..PRODUCER_THREADS)
                 .map(|thread_index| {
                     let broadcast = broadcast.clone();
                     thread::spawn(move || {
-                        for tenure in 0..TENURES_PER_THREAD {
-                            let id = thread_index * TENURES_PER_THREAD + tenure;
+                        for producer_index in 0..PRODUCERS_PER_THREAD {
+                            let id = thread_index * PRODUCERS_PER_THREAD + producer_index;
                             let mut producer = loop {
                                 match broadcast.producer(ProducerId::new(id)) {
                                     Ok(producer) => break producer,
@@ -3486,7 +3486,7 @@ mod tests {
                                     Err(err) => panic!("unexpected error: {err:?}"),
                                 }
                             };
-                            for _ in 0..ITEMS_PER_TENURE {
+                            for _ in 0..ITEMS_PER_PRODUCER {
                                 while producer.try_write(id).is_err() {
                                     thread::yield_now();
                                 }
