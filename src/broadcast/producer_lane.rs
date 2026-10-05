@@ -30,13 +30,30 @@ pub(super) struct LaneHeader {
     /// First sequence of the current or most recent owner's tenure. Sequences
     /// below it were published by an earlier owner whose id is no longer stored.
     tenure_start: AtomicUsize,
-    /// Count of messages refused by backpressure over the lane's lifetime.
-    rejected_items: AtomicU64,
+    /// Count of messages refused by backpressure over the lane's lifetime. On
+    /// its own cache line: the producer bumps it on every refused reserve, which
+    /// would otherwise evict the ownership fields consumers read.
+    rejected_items: CacheAlignedAtomicU64,
     /// Claimed-up-to sequence: advanced before a ring cell is written.
     producer_reservation: CacheAlignedAtomicSize,
     /// Visible-up-to sequence: advanced after a ring cell is written; consumers
     /// read sequences `< producer_publication`.
     producer_publication: CacheAlignedAtomicSize,
+}
+
+/// `AtomicU64` with 64-byte alignment.
+#[derive(Default)]
+#[repr(C, align(64))]
+struct CacheAlignedAtomicU64 {
+    inner: AtomicU64,
+}
+
+impl core::ops::Deref for CacheAlignedAtomicU64 {
+    type Target = AtomicU64;
+
+    fn deref(&self) -> &Self::Target {
+        &self.inner
+    }
 }
 
 /// A single producer's lane.
@@ -191,7 +208,7 @@ impl ProducerLane {
             state: AtomicU64::new(LANE_FREE),
             producer_id: AtomicU64::new(0),
             tenure_start: AtomicUsize::new(0),
-            rejected_items: AtomicU64::new(0),
+            rejected_items: CacheAlignedAtomicU64::default(),
             producer_reservation: CacheAlignedAtomicSize::default(),
             producer_publication: CacheAlignedAtomicSize::default(),
         };
