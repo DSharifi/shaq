@@ -2,6 +2,7 @@ use crate::{
     checked_queue_size,
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
+    select::{self, sealed::Sealed, ExclusiveEndpoint, WaitWord},
     shmem::Region,
     sync::atomic::{AtomicU64, Ordering},
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
@@ -536,6 +537,34 @@ impl<T> Consumer<T> {
 // to another thread when `T: Send`.
 unsafe impl<T: Send> Send for Consumer<T> {}
 
+impl<T> Sealed for Consumer<T> {}
+
+impl<T> select::Receive for Consumer<T> {}
+
+/// The only consumer, so the only waiter its producer's publish can wake.
+impl<T> ExclusiveEndpoint for Consumer<T> {
+    type Output = T;
+
+    #[inline]
+    fn try_take(&mut self) -> Option<T> {
+        // Unlike `try_read`, store the read cursor only after taking an item.
+        if self.queue.is_empty() {
+            self.queue.load_write();
+        }
+        let item = self.try_read_inner()?;
+        self.finalize();
+        Some(item)
+    }
+
+    unsafe fn split_wait_word(&mut self) -> (&mut Self, WaitWord<'_>) {
+        // SAFETY: `*self` keeps the header's mapping alive while it is
+        // borrowed, which the caller does not end early by replacing it. The
+        // header is not part of `Self`, so this does not alias the `&mut`.
+        let header: &SharedQueueHeader = unsafe { self.queue.header.as_ref() };
+        (self, WaitWord::new(&header.waiters, &header.write))
+    }
+}
+
 impl<T> Drop for Consumer<T> {
     fn drop(&mut self) {
         self.finalize();
@@ -1064,9 +1093,12 @@ impl SharedQueueHeader {
         // - `header` is non-null and aligned properly.
         // - `access` to `header` is unique.
         let header = unsafe { header.as_mut() };
-        header.write.store(0, Ordering::Release);
-        header.read.store(0, Ordering::Release);
-        header.waiters.initialize();
+        // Assign fields one at a time, leaving the padding as it is in the
+        // file. Fresh atomics, rather than stores, let loom model the header.
+        header.magic = AtomicU64::new(0);
+        header.write.reset();
+        header.read.reset();
+        header.waiters.reset();
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.identifier = identifier;

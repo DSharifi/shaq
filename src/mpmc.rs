@@ -4,6 +4,7 @@ use crate::{
     checked_queue_size,
     error::{Error, WaitError},
     futex::{Waiters, SPIN_ATTEMPTS},
+    select::{self, sealed::Sealed, SharedEndpoint, WaitWord},
     shmem::Region,
     sync::atomic::{AtomicU64, Ordering},
     CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION,
@@ -508,6 +509,31 @@ unsafe impl<T: Send> Send for Consumer<T> {}
 // SAFETY: See the `Send` impl above; the queue protocol synchronizes all access.
 unsafe impl<T: Send> Sync for Consumer<T> {}
 
+impl<T> Sealed for Consumer<T> {}
+
+impl<T> select::Receive for Consumer<T> {}
+
+/// Consumers compete for items, and a publish wakes at most as many waiters
+/// as it published items.
+impl<T> SharedEndpoint for Consumer<T> {
+    type Output = T;
+
+    #[inline]
+    fn try_take(&self) -> Option<T> {
+        self.try_read()
+    }
+
+    #[inline]
+    fn wait_word(&self) -> WaitWord<'_> {
+        let header = self.queue.header();
+        WaitWord::competing(
+            &header.waiters,
+            &header.producer_publication,
+            &header.consumer_reservation,
+        )
+    }
+}
+
 /// Calculates the minimum file size required for a queue with given capacity.
 /// Note that file size MAY need to be increased beyond this to account for
 /// page-size requirements.
@@ -613,6 +639,13 @@ impl<T> SharedQueue<T> {
     #[inline]
     fn capacity(&self) -> usize {
         self.buffer_mask.wrapping_add(1)
+    }
+
+    #[inline]
+    fn header(&self) -> &SharedQueueHeader {
+        // SAFETY: the header is initialized, lives in `self.region`, and is
+        // never accessed mutably after creation.
+        unsafe { self.header.as_ref() }
     }
 
     fn reserve_write(&self) -> Option<(NonNull<T>, usize)> {
@@ -884,11 +917,14 @@ impl SharedQueueHeader {
         // - `header` is non-null and aligned properly.
         // - `access` to `header` is unique.
         let header = unsafe { header_ptr.as_mut() };
-        header.producer_reservation.store(0, Ordering::Release);
-        header.producer_publication.store(0, Ordering::Release);
-        header.consumer_reservation.store(0, Ordering::Release);
-        header.consumer_release.store(0, Ordering::Release);
-        header.waiters.initialize();
+        // Assign fields one at a time, leaving the padding as it is in the
+        // file. Fresh atomics, rather than stores, let loom model the header.
+        header.magic = AtomicU64::new(0);
+        header.producer_reservation.reset();
+        header.producer_publication.reset();
+        header.consumer_reservation.reset();
+        header.consumer_release.reset();
+        header.waiters.reset();
         header.buffer_mask = u32::try_from(buffer_size_in_items - 1).unwrap();
         header.version = VERSION;
         header.identifier = identifier;

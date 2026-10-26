@@ -132,3 +132,25 @@ fn publication_wakes_waiter() {
         consumer.join().unwrap();
     });
 }
+
+// Tests a select sleeping on a broadcast consumer and another queue at once.
+// A publish, which bumps the shared wake word only when a waiter is
+// registered, must be observed before sleeping or wake the select.
+#[test]
+fn publication_wakes_select() {
+    loom::model(|| {
+        let broadcast = broadcast();
+        let mut producer = broadcast.producer().unwrap();
+        let mut consumer = broadcast.consumer().unwrap();
+        let (_mpmc_tx, mpmc_rx) = crate::mpmc::pair::<usize>(1).unwrap();
+        let select = thread::spawn(move || {
+            crate::select! {
+                recv(consumer) -> value => value,
+                recv(mpmc_rx) -> value => value,
+            }
+        });
+
+        producer.try_write(7).unwrap();
+        assert_eq!(select.join().unwrap(), 7);
+    });
+}

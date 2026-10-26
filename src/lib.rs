@@ -7,6 +7,7 @@ pub mod broadcast;
 pub mod error;
 mod futex;
 pub mod mpmc;
+pub mod select;
 mod shmem;
 pub mod spsc;
 mod sync;
@@ -45,6 +46,16 @@ pub(crate) const fn checked_queue_size(
 #[repr(C, align(64))]
 struct CacheAlignedAtomicSize {
     inner: AtomicUsize,
+}
+
+impl CacheAlignedAtomicSize {
+    /// Zeroes a value in a new shared-memory header. Assigning a fresh atomic,
+    /// rather than storing to it, lets loom model the header. Writing only the
+    /// atomic leaves the padding as it is in the file: a whole-value write could
+    /// copy the writer's stack bytes into it.
+    fn reset(&mut self) {
+        self.inner = AtomicUsize::new(0);
+    }
 }
 
 impl core::ops::Deref for CacheAlignedAtomicSize {

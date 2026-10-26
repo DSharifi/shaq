@@ -72,6 +72,7 @@ use std::time::Duration;
 
 use crate::error::{Error, WaitError};
 use crate::futex::{Waiters, SPIN_ATTEMPTS};
+use crate::select::{self, sealed::Sealed, ExclusiveEndpoint, WaitWord};
 use crate::shmem::Region;
 use crate::{CacheAlignedAtomicSize, DEFAULT_QUEUE_IDENTIFIER, VERSION};
 
@@ -1513,6 +1514,32 @@ impl<T: Copy> Consumer<T> {
 // SAFETY: a consumer is single-threaded (read ops take `&mut self`) but may be
 // moved between threads.
 unsafe impl<T: Copy + Send> Send for Consumer<T> {}
+
+impl<T: Copy> Sealed for Consumer<T> {}
+
+impl<T: Copy> select::Receive for Consumer<T> {}
+
+/// A publish wakes every waiter, so no consumer's wake can be absorbed by
+/// another.
+impl<T: Copy> ExclusiveEndpoint for Consumer<T> {
+    type Output = T;
+
+    #[inline]
+    fn try_take(&mut self) -> Option<T> {
+        self.try_read()
+    }
+
+    unsafe fn split_wait_word(&mut self) -> (&mut Self, WaitWord<'_>) {
+        // SAFETY: `*self` keeps the header's mapping alive while it is
+        // borrowed, which the caller does not end early by replacing it. The
+        // header is not part of `Self`, so this does not alias the `&mut`.
+        let header: &SharedQueueHeader = unsafe { self.core.queue.header.as_ref() };
+        // A check scans every lane.
+        let word = WaitWord::new(&header.waiters, &header.wake_seq)
+            .with_check_cost(self.core.queue.producer_slots());
+        (self, word)
+    }
+}
 
 /// An in-place borrow of one published value. The consumer's cursor stays at
 /// this value's sequence while the guard lives (so the producer cannot overwrite
